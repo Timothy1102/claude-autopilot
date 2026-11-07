@@ -1,0 +1,67 @@
+{
+  "plan_id": "billing-v2",
+  "base_branch": "main",
+  "defaults": {
+    "model": "claude-sonnet-5-5",
+    "effort": "medium",
+    "max_attempts": 3,
+    "max_budget_usd": 8,
+    "timeout_minutes": 90,
+    "setup": ["cp ../myrepo/.env .env 2>/dev/null || true", "npm ci"],
+    "verify": ["npm run typecheck", "npm run lint", "npm test -- --run"],
+    "review": false,
+    "reviewer": { "model": "claude-opus-5-5", "effort": "high" },
+    "permission_mode": "auto"
+  },
+  "tasks": [
+    {
+      "id": "T01",
+      "title": "Invoice schema and migration",
+      "model": "claude-sonnet-5-5",
+      "effort": "high",
+      "review": true,
+      "context_files": ["src/db/schema.ts", "src/db/migrations/"],
+      "instructions": "Add the Invoice and InvoiceLine tables from SPEC §Design/Data model, following D2 (integer cents) and D3 (soft delete). Write the migration in the same style as the newest file in src/db/migrations/.",
+      "acceptance": ["Migration applies and rolls back on an empty DB", "Types exported from src/db/index.ts"],
+      "verify": ["npm test -- --run src/db"]
+    },
+    {
+      "id": "T02",
+      "title": "Fixtures and factories for invoices",
+      "depends_on": ["T01"],
+      "model": "claude-haiku-5-5",
+      "effort": "medium",
+      "instructions": "Add test factories for Invoice and InvoiceLine in test/factories/, copying the pattern in test/factories/user.ts.",
+      "acceptance": ["Factories produce valid rows accepted by the schema"],
+      "verify": ["npm test -- --run test/factories"]
+    },
+    {
+      "id": "T03",
+      "title": "Invoice service: create, finalize, void",
+      "depends_on": ["T01", "T02"],
+      "instructions": "Implement src/billing/invoice-service.ts per SPEC §Design/Service and D4-D6, with unit tests for every state transition listed in the spec.",
+      "acceptance": ["All transitions in SPEC table are covered by tests", "Illegal transitions throw InvoiceStateError"],
+      "verify": ["npm test -- --run src/billing"]
+    },
+    {
+      "id": "T04",
+      "title": "Integration pass",
+      "depends_on": ["T03"],
+      "model": "claude-opus-5-5",
+      "effort": "high",
+      "instructions": "Run the full build and test suite, fix any fallout from T01-T03 without changing the spec'd behaviour, and update docs/billing.md.",
+      "acceptance": ["Full suite green", "docs/billing.md describes the new invoice lifecycle"],
+      "verify": ["npm run build"]
+    },
+    {
+      "id": "T05",
+      "title": "Final review report",
+      "depends_on": ["T04"],
+      "model": "claude-opus-5-5",
+      "effort": "high",
+      "instructions": "Read-only review of everything on this branch against SPEC.md. Do not change code. Write .autopilot/billing-v2/REVIEW.md listing spec deviations, risks, and suggested follow-ups, ordered by severity.",
+      "acceptance": ["REVIEW.md exists and references concrete files"],
+      "verify": ["test -s .autopilot/billing-v2/REVIEW.md"]
+    }
+  ]
+}
