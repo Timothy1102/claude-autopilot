@@ -414,11 +414,21 @@ class Runner:
             s = st["tasks"].setdefault(t["id"], {"status": "pending", "attempts": 0, "cost_usd": 0.0, "history": []})
             if s["status"] == "running":
                 s["status"] = "pending"
+                self._refund_attempt(s)
                 self.crashed = True
             if getattr(self.args, "retry_failed", False) and s["status"] in ("failed", "blocked", "skipped"):
                 s.update(status="pending", attempts=0)
                 s.pop("reason", None)
         return st
+
+    @staticmethod
+    def _refund_attempt(s):
+        """Give back an attempt that was cut short (Ctrl+C, crash, server restart) so the rerun
+        uses the same model/effort instead of escalating."""
+        h = s.get("history") or []
+        if h and "outcome" not in h[-1] and s.get("attempts", 0) > 0:
+            h.pop()
+            s["attempts"] -= 1
 
     def save(self):
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -901,6 +911,7 @@ class Runner:
             for s in self.state["tasks"].values():
                 if s["status"] == "running":
                     s["status"] = "pending"
+                    self._refund_attempt(s)
             self.save()
             self.log("interrupted; state saved, rerun the same command to resume")
             self.herdr.release()
