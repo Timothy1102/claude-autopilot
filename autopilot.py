@@ -57,11 +57,29 @@ DEFAULTS = {
     "review": False,                # run a reviewer session on every task's diff
     "reviewer": {"model": "claude-opus-5-5", "effort": "high", "max_budget_usd": 4.0},
     "permission_mode": "auto",      # auto | acceptEdits | dontAsk | bypassPermissions
-    "limit_wait_minutes": 30,       # sleep when a usage/rate limit is hit
+    "limit_wait_minutes": 30,       # sleep when a usage/rate limit is hit and the message gives no reset time
     "max_limit_waits": 16,
     "extra_args": [],               # appended to every `claude` call
     "stream": True,                 # stream-json: live view of what each worker is doing
+    # Cost/time controls. A rejected attempt (verify failed, reviewer asked for changes, commit hook
+    # failed) is first handed back to the *same* session, which already holds the context and the
+    # uncommitted work, before the tree is reset and a stronger model starts from scratch.
+    "fixups": 1,                    # fix-up rounds per attempt (0 = always reset and escalate)
+    "fixup_budget_usd": 4.0,        # extra budget each fix-up round may spend
+    "fixup_timeout_minutes": 30,
+    "inline_spec_kb": 48,           # paste SPEC/PROGRESS/DECISIONS into the prompt when SPEC.md is at most this size
+    "review_inline_diff_kb": 120,   # larger diffs are truncated; the reviewer runs `git diff` for the rest
 }
+
+FIXUP_MESSAGE = (
+    "The orchestrator checked your work and rejected it. Your changes are still in the working tree, "
+    "nothing was reset. Fix the problem below, re-run the verification commands until they pass, and end "
+    "with the structured result again. Never make a check pass by weakening it.\n\n"
+)
+
+
+class LimitExhausted(Exception):
+    """The usage limit did not clear within max_limit_waits; the run should stop, not escalate."""
 
 # Workers must never touch git history; the orchestrator owns commits.
 DENIED_TOOLS = ",".join([
@@ -112,6 +130,31 @@ def fmt_dur(seconds: float) -> str:
 def tail(text: str, n: int = 6000) -> str:
     text = text or ""
     return text if len(text) <= n else "…(truncated)…\n" + text[-n:]
+
+
+def parse_limit_wait(text: str, now: dt.datetime | None = None):
+    """Minutes to wait when a limit message states a reset time ("try again in 25 minutes",
+    "resets at 3am"); None when it gives no usable time. Capped at 6 hours."""
+    t = " ".join((text or "").lower().split())
+    m = re.search(r"(?:try again|retry|reset\w*|available|wait)[^.\n]{0,40}?\bin (?:about |~)?(\d+)\s*"
+                  r"(seconds?|secs?|minutes?|mins?|hours?|hrs?)\b", t)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        mins = n / 60 if unit.startswith("s") else n * 60 if unit.startswith("h") else n
+        return max(1, min(int(mins) + 1, 6 * 60))
+    m = re.search(r"reset\w*(?: at| by| around)? (\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", t)
+    if m:
+        hour, minute, ampm = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+        if ampm:
+            hour = hour % 12 + (12 if ampm == "pm" else 0)
+        if hour > 23 or minute > 59:
+            return None
+        now = now or dt.datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += dt.timedelta(days=1)
+        return max(1, min(int((target - now).total_seconds() / 60) + 1, 6 * 60))
+    return None
 
 
 class Logger:
@@ -504,9 +547,14 @@ class Runner:
         return proc.returncode, lines, stderr
 
     def claude_call(self, *, prompt, model, effort, schema, rules_file, budget, tag,
-                    permission_mode=None, allowed_tools=None, timeout_min=None):
-        """Runs claude -p; waits and resumes on usage/rate limits. Returns (data|None, raw, cost_delta)."""
-        resume_sid, waits, cost, prev_total = None, 0, 0.0, 0.0
+                    permission_mode=None, allowed_tools=None, timeout_min=None,
+                    resume_sid=None, prev_total=0.0):
+        """Runs claude -p; waits and resumes on usage/rate limits. Returns (data|None, raw, cost_delta).
+
+        resume_sid continues an existing session (fix-up rounds); prev_total is what that session had
+        already reported as total_cost_usd, so only the new spend is counted. Raises LimitExhausted when
+        the limit does not clear within max_limit_waits."""
+        waits, cost, text_in = 0, 0.0, prompt
         while True:
             stream = bool(self.d.get("stream", True))
             cmd = [
@@ -525,10 +573,8 @@ class Runner:
             if allowed_tools:
                 cmd += ["--allowedTools", allowed_tools]
             cmd += list(self.d["extra_args"])
-            text_in = prompt
             if resume_sid:
                 cmd += ["--resume", resume_sid]
-                text_in = "You were interrupted by a usage/rate limit. Continue the task exactly where you left off."
             logs = self.run_dir / "logs"
             logs.mkdir(parents=True, exist_ok=True)
             n = len(list(logs.glob(f"{tag}-*.jsonl")))
@@ -541,21 +587,28 @@ class Runner:
                 data = parse_json_output(stdout)
             if isinstance(data, dict):
                 total = float(data.get("total_cost_usd") or 0)
-                cost += max(total - prev_total, 0) if resume_sid else total
+                # Claude Code >= 2.1.277 reports the cumulative session cost on --resume (older
+                # versions restart at zero). A resumed process always makes at least one API call,
+                # so a cumulative total strictly grows; anything else is this process's own spend.
+                cost += total - prev_total if total > prev_total else total
                 prev_total = total
             raw = f"{stdout}\n{stderr}"
             errored = rc != 0 or (isinstance(data, dict) and data.get("is_error"))
             # Only look for limit messages in stderr and the final result, never in tool output
             # (a worker reading code about rate limiting must not look like a usage limit).
-            limit_text = stderr + "\n" + "".join(lines[-2:]) + "\n" + str((data or {}).get("result", ""))
-            if errored and LIMIT_RE.search(tail(limit_text, 4000)) and waits < self.d["max_limit_waits"]:
+            limit_text = tail(stderr + "\n" + "".join(lines[-2:]) + "\n" + str((data or {}).get("result", "")), 4000)
+            if errored and LIMIT_RE.search(limit_text):
+                if waits >= self.d["max_limit_waits"]:
+                    raise LimitExhausted(f"{tag}: usage limit still in place after {waits} waits")
                 waits += 1
                 if isinstance(data, dict) and data.get("session_id"):
                     resume_sid = data["session_id"]
-                self.log(f"{tag}: usage/rate limit hit, sleeping {self.d['limit_wait_minutes']} min "
+                    text_in = "You were interrupted by a usage/rate limit. Continue the task exactly where you left off."
+                wait_min = parse_limit_wait(limit_text) or self.d["limit_wait_minutes"]
+                self.log(f"{tag}: usage/rate limit hit, sleeping {wait_min} min "
                          f"(wait {waits}/{self.d['max_limit_waits']})")
-                self.herdr.report("working", f"{self.current}: waiting for usage limit reset")
-                time.sleep(self.d["limit_wait_minutes"] * 60)
+                self.herdr.report("working", f"{self.current}: waiting {wait_min} min for usage limit reset")
+                time.sleep(wait_min * 60)
                 continue
             if errored:
                 return None, raw, cost
@@ -576,8 +629,10 @@ class Runner:
         git(self.wt, "add", "-A")
         stat = git(self.wt, "diff", "--cached", "--stat", start_head)
         diff = git(self.wt, "diff", "--cached", start_head)
-        if len(diff) > 300_000:
-            diff = diff[:300_000] + "\n…(diff truncated; read the files directly if needed)…"
+        cap = int(self.d["review_inline_diff_kb"]) * 1024
+        if len(diff) > cap:
+            diff = diff[:cap] + (f"\n…(diff truncated at {cap // 1024} KB; the files above are the hot spots. "
+                                 f"Run `git diff --cached {start_head} -- <path>` for any file you need in full)…")
         prompt = (
             f"Review task {task['id']}: {task['title']}\n\n"
             f"Spec: {self.rel.as_posix()}/SPEC.md\n\nInstructions given to the worker:\n{task['instructions']}\n\n"
@@ -588,7 +643,8 @@ class Runner:
         data, raw, cost = self.claude_call(
             prompt=prompt, model=r["model"], effort=r["effort"], schema=REVIEW_SCHEMA,
             rules_file=PROMPTS_DIR / "reviewer.md", budget=r["max_budget_usd"], tag=f"{task['id']}-review",
-            permission_mode="dontAsk", allowed_tools="Read,Grep,Glob", timeout_min=30,
+            permission_mode="dontAsk", timeout_min=30,
+            allowed_tools="Read,Grep,Glob,Bash(git diff *),Bash(git show *),Bash(git log *)",
         )
         so = (data or {}).get("structured_output") or {}
         if not so:
@@ -597,11 +653,27 @@ class Runner:
         return so.get("verdict") == "approve", so.get("issues", []), cost, None
 
     # ---- one task
+    def _plan_file(self, name, limit_kb, tail_only=False):
+        """Contents of a plan file for inlining into the prompt; None if missing or too big."""
+        try:
+            text = (self.wt_plan / name).read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if len(text) > limit_kb * 1024:
+            return tail(text, limit_kb * 1024) if tail_only else None
+        return text
+
     def build_prompt(self, task, feedback):
         rel = self.rel.as_posix()
+        # Pasting the plan files saves the worker three read round-trips per task (it would read
+        # them in full anyway); the logs are tailed so a long run does not bloat every prompt.
+        spec = self._plan_file("SPEC.md", int(self.d["inline_spec_kb"] or 0))
+        files = f"`{rel}/SPEC.md`, `{rel}/PROGRESS.md`, `{rel}/DECISIONS.md`"
         parts = [
             f"# Autopilot task {task['id']}: {task['title']}",
-            f"Plan `{self.pid}`. Read first: `{rel}/SPEC.md`, `{rel}/PROGRESS.md`, `{rel}/DECISIONS.md`.",
+            (f"Plan `{self.pid}`. The spec, progress log and decisions log are included at the end of this "
+             f"message (files: {files}); do not re-read them unless a log is marked truncated.")
+            if spec is not None else f"Plan `{self.pid}`. Read first: {files}.",
             "## What to do\n" + task["instructions"],
         ]
         if task.get("acceptance"):
@@ -616,13 +688,51 @@ class Runner:
             parts.append("## A previous attempt at this task was rejected\n"
                          "The working tree was reset to the last good commit. Avoid repeating the problem below.\n\n"
                          + feedback)
+        if spec is not None:
+            parts.append("## SPEC.md\n" + spec)
+            parts.append("## PROGRESS.md (what earlier tasks did)\n" + (self._plan_file("PROGRESS.md", 12, True) or ""))
+            parts.append("## DECISIONS.md\n" + (self._plan_file("DECISIONS.md", 8, True) or ""))
         return "\n\n".join(parts) + "\n"
+
+    def gate(self, task, start_head, entry, account):
+        """Orchestrator-side checks of a worker's 'done'. Returns (ok, problem, outcome)."""
+        ok, out = self.verify(task)
+        if not ok:
+            return False, "Verification failed:\n" + out, "verify-failed"
+        if task.get("review", self.d["review"]):
+            approved, issues, rcost, note = self.review(task, start_head)
+            account(rcost)
+            if note:
+                entry["review_note"] = note
+            if not approved:
+                self.log(f"{task['id']}: reviewer requested changes ({len(issues)} issues)")
+                return False, "A reviewer requested changes:\n" + "\n".join(f"- {i}" for i in issues), "review-rejected"
+        return True, "", ""
+
+    def commit_task(self, task, attempt, model, effort, so, summary):
+        """Append to PROGRESS.md and commit. Returns (ok, problem)."""
+        tid = task["id"]
+        with (self.wt_plan / "PROGRESS.md").open("a", encoding="utf-8") as f:
+            f.write(f"\n## {tid} — {task['title']}\n- Done on attempt {attempt} ({model}, {effort})\n"
+                    f"- Summary: {summary}\n")
+            if so.get("notes_for_next_tasks"):
+                f.write(f"- Notes for next tasks: {so['notes_for_next_tasks']}\n")
+            for dcs in so.get("decisions", []):
+                f.write(f"- Decision: {dcs}\n")
+        git(self.wt, "add", "-A")
+        c = run(["git", "commit", "-m", f"autopilot({tid}): {task['title']}", "-m", summary[:3000]],
+                self.wt, check=False)
+        if c.returncode != 0:
+            return False, "The git pre-commit hook rejected the change:\n" + tail(c.stdout + c.stderr, 3000)
+        return True, ""
 
     def run_task(self, task):
         tid, st = task["id"], self.state["tasks"][task["id"]]
         st["status"] = "running"
         self.save()
         feedback = st.get("last_feedback")
+        max_fixups = int(task.get("fixups", self.d["fixups"]))
+        budget = float(task.get("max_budget_usd", self.d["max_budget_usd"]))
         while st["attempts"] < task.get("max_attempts", self.d["max_attempts"]):
             st["attempts"] += 1
             attempt = st["attempts"]
@@ -631,88 +741,102 @@ class Runner:
             start_head = git(self.wt, "rev-parse", "HEAD")
             self.log(f"{tid} attempt {attempt}: {model} / {effort}")
             self.current = f"{tid} a{attempt}"
-            self.herdr_progress(f"{tid} {task['title']} · attempt {attempt} · {model.replace('claude-', '')}/{effort}")
+            label = f"{tid} {task['title']} · attempt {attempt} · {model.replace('claude-', '')}/{effort}"
+            self.herdr_progress(label)
             started = time.time()
-            data, raw, cost = self.claude_call(
-                prompt=self.build_prompt(task, feedback), model=model, effort=effort,
-                schema=RESULT_SCHEMA, rules_file=PROMPTS_DIR / "worker.md",
-                budget=task.get("max_budget_usd", self.d["max_budget_usd"]), tag=f"{tid}-a{attempt}",
-                timeout_min=task.get("timeout_minutes"),
-            )
-            st["cost_usd"] += cost
-            self.state["total_cost_usd"] += cost
-            entry = {"attempt": attempt, "model": model, "effort": effort, "cost_usd": round(cost, 4),
+            entry = {"attempt": attempt, "model": model, "effort": effort, "cost_usd": 0.0, "fixups": 0,
                      "started_at": dt.datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M:%S"),
-                     "minutes": round((time.time() - started) / 60, 1),
-                     "session_id": (data or {}).get("session_id")}
+                     "minutes": 0.0, "session_id": None}
             st["history"].append(entry)
 
-            if data is None:
-                feedback = "The session crashed, timed out or hit its budget cap:\n" + tail(raw, 3000)
-                entry["outcome"] = "error"
-                self.log(f"{tid}: session error")
-                self.save()
-                continue
-            so = data.get("structured_output") or {}
-            status = so.get("status", "unreported")
-            summary = so.get("summary") or tail(data.get("result", ""), 1500)
+            def account(cost):
+                st["cost_usd"] += cost
+                self.state["total_cost_usd"] += cost
+                entry["cost_usd"] = round(entry["cost_usd"] + cost, 4)
 
-            if status == "blocked":
-                st.update(status="blocked", question=so.get("question", summary),
-                          recommended_answer=so.get("recommended_answer", ""))
-                entry["outcome"] = "blocked"
-                self.log(f"{tid}: BLOCKED — {st['question']}")
-                self.reset_clean()
+            def finish(outcome):
+                entry["outcome"] = outcome
+                entry["minutes"] = round((time.time() - started) / 60, 1)
                 self.save()
-                return
-            if status == "failed":
-                feedback = "The previous worker gave up and reported:\n" + summary
-                entry["outcome"] = "worker-failed"
-                self.save()
-                continue
 
-            ok, out = self.verify(task)
-            if not ok:
-                feedback = "Verification failed:\n" + out
-                entry["outcome"] = "verify-failed"
-                self.log(f"{tid}: verification failed")
+            try:
+                data, raw, cost = self.claude_call(
+                    prompt=self.build_prompt(task, feedback), model=model, effort=effort,
+                    schema=RESULT_SCHEMA, rules_file=PROMPTS_DIR / "worker.md", budget=budget,
+                    tag=f"{tid}-a{attempt}", timeout_min=task.get("timeout_minutes"),
+                )
+            except LimitExhausted:
+                # Nothing of this attempt is usable; give it back so the resume does not escalate.
+                st["history"].pop()
+                st["attempts"] -= 1
+                st["status"] = "pending"
                 self.save()
-                continue
+                raise
+            account(cost)
+            entry["session_id"] = (data or {}).get("session_id")
 
-            if task.get("review", self.d["review"]):
-                approved, issues, rcost, note = self.review(task, start_head)
-                st["cost_usd"] += rcost
-                self.state["total_cost_usd"] += rcost
-                if note:
-                    entry["review_note"] = note
-                if not approved:
-                    feedback = "A reviewer requested changes:\n" + "\n".join(f"- {i}" for i in issues)
-                    entry["outcome"] = "review-rejected"
-                    self.log(f"{tid}: reviewer requested changes ({len(issues)} issues)")
-                    self.save()
+            fixups = 0
+            while True:
+                # One worker result per iteration: the first from a fresh session, later ones from
+                # fix-up rounds in the same session. Leaving this loop means reset + next attempt.
+                if data is None:
+                    feedback = "The session crashed, timed out or hit its budget cap:\n" + tail(raw, 3000)
+                    self.log(f"{tid}: session error")
+                    finish("error")
+                    break
+                so = data.get("structured_output") or {}
+                status = so.get("status", "unreported")
+                summary = so.get("summary") or tail(data.get("result", ""), 1500)
+
+                if status == "blocked":
+                    st.update(status="blocked", question=so.get("question", summary),
+                              recommended_answer=so.get("recommended_answer", ""))
+                    self.log(f"{tid}: BLOCKED — {st['question']}")
+                    self.reset_clean()
+                    finish("blocked")
+                    return
+                if status == "failed":
+                    feedback = "The previous worker gave up and reported:\n" + summary
+                    finish("worker-failed")
+                    break
+
+                ok, problem, outcome = self.gate(task, start_head, entry, account)
+                if ok:
+                    ok, problem = self.commit_task(task, attempt, model, effort, so, summary)
+                    outcome = "" if ok else "commit-hook-failed"
+                if ok:
+                    st.update(status="done", summary=summary, commit=git(self.wt, "rev-parse", "--short", "HEAD"))
+                    st.pop("last_feedback", None)
+                    finish("done")
+                    self.log(f"{tid}: DONE ({st['commit']}, ${st['cost_usd']:.2f}, {fmt_dur(time.time() - started)})")
+                    return
+
+                sid = data.get("session_id")
+                if fixups < max_fixups and sid:
+                    fixups += 1
+                    entry["fixups"] = fixups
+                    self.log(f"{tid}: {outcome}; asking the same session to fix it (fix-up {fixups}/{max_fixups})")
+                    self.current = f"{tid} a{attempt} fix{fixups}"
+                    self.herdr_progress(f"{label} · fix-up {fixups}")
+                    try:
+                        data, raw, cost = self.claude_call(
+                            prompt=FIXUP_MESSAGE + problem, model=model, effort=effort, schema=RESULT_SCHEMA,
+                            rules_file=PROMPTS_DIR / "worker.md", tag=f"{tid}-a{attempt}-fix{fixups}",
+                            # --max-budget-usd counts only this process's spend, not the resumed session's past.
+                            budget=float(self.d["fixup_budget_usd"]),
+                            timeout_min=self.d["fixup_timeout_minutes"],
+                            resume_sid=sid, prev_total=float(data.get("total_cost_usd") or 0),
+                        )
+                    except LimitExhausted:
+                        st["status"] = "pending"
+                        finish("limit")
+                        raise
+                    account(cost)
                     continue
-
-            with (self.wt_plan / "PROGRESS.md").open("a", encoding="utf-8") as f:
-                f.write(f"\n## {tid} — {task['title']}\n- Done on attempt {attempt} ({model}, {effort})\n"
-                        f"- Summary: {summary}\n")
-                if so.get("notes_for_next_tasks"):
-                    f.write(f"- Notes for next tasks: {so['notes_for_next_tasks']}\n")
-                for dcs in so.get("decisions", []):
-                    f.write(f"- Decision: {dcs}\n")
-            git(self.wt, "add", "-A")
-            c = run(["git", "commit", "-m", f"autopilot({tid}): {task['title']}", "-m", summary[:3000]],
-                    self.wt, check=False)
-            if c.returncode != 0:
-                feedback = "The git pre-commit hook rejected the change:\n" + tail(c.stdout + c.stderr, 3000)
-                entry["outcome"] = "commit-hook-failed"
-                self.save()
-                continue
-            entry["outcome"] = "done"
-            st.update(status="done", summary=summary, commit=git(self.wt, "rev-parse", "--short", "HEAD"))
-            st.pop("last_feedback", None)
-            self.log(f"{tid}: DONE ({st['commit']}, ${st['cost_usd']:.2f})")
-            self.save()
-            return
+                feedback = problem
+                self.log(f"{tid}: {outcome}")
+                finish(outcome)
+                break
 
         st.update(status="failed", last_feedback=feedback)
         self.reset_clean()
@@ -724,7 +848,9 @@ class Runner:
         order = topo_order(self.plan["tasks"])
         only = set(self.args.only.split(",")) if self.args.only else None
         if self.args.dry_run:
-            print(f"Plan {self.pid}: {len(order)} tasks, worktree would be {self.wt}, branch {self.branch}\n")
+            print(f"Plan {self.pid}: {len(order)} tasks, worktree would be {self.wt}, branch {self.branch}")
+            print(f"  fix-ups per attempt: {self.d['fixups']} (same session, +${self.d['fixup_budget_usd']:.2f} "
+                  f"budget each, {self.d['fixup_timeout_minutes']} min); then reset and escalate\n")
             for t in order:
                 m, e = pick_model(t, self.d, 1)
                 m2, e2 = pick_model(t, self.d, 2)
@@ -767,6 +893,8 @@ class Runner:
                     break
         except StopIteration:
             pass
+        except LimitExhausted as e:
+            self.log(f"{e}; stopping instead of escalating. Rerun the same command once your usage limit resets.")
         except KeyboardInterrupt:
             for s in self.state["tasks"].values():
                 if s["status"] == "running":
@@ -820,8 +948,10 @@ class Runner:
             return
         c = self.counts()
         needs_you = c.get("failed", 0) + c.get("blocked", 0)
-        if needs_you:
-            msg = f"{needs_you} task(s) need you: see {self.rel.as_posix()}/run/REPORT.md"
+        if needs_you or c.get("pending", 0):
+            msg = (f"{needs_you} task(s) need you" if needs_you
+                   else f"stopped early (budget or usage limit), {c['pending']} task(s) pending")
+            msg += f": see {self.rel.as_posix()}/run/REPORT.md"
             self.herdr.report("blocked", msg, resume_argv=self.resume_argv())
             self.herdr.notify(f"autopilot {self.pid} needs you", summary, sound="request")
         else:
@@ -851,14 +981,17 @@ class Runner:
                  f"- Estimated cost so far: ${self.state['total_cost_usd']:.2f}",
                  f"- Run time so far: {fmt_dur(self.state['elapsed_seconds'])} "
                  f"(started {self.state.get('first_started_at', '-')})", "",
-                 "| Task | Status | Attempts | Last model / effort | Cost | Note |",
-                 "|---|---|---|---|---|---|"]
+                 "| Task | Status | Attempts (fix-ups) | Last model / effort | Time | Cost | Note |",
+                 "|---|---|---|---|---|---|---|"]
         for t in self.plan["tasks"]:
             s = self.state["tasks"][t["id"]]
             last = s["history"][-1] if s["history"] else {}
             note = s.get("commit") or s.get("reason") or (s.get("question", "")[:80])
-            lines.append(f"| {t['id']} {t['title']} | {s['status']} | {s['attempts']} | "
-                         f"{last.get('model', '-')} / {last.get('effort', '-')} | ${s['cost_usd']:.2f} | {note} |")
+            fix = sum(h.get("fixups", 0) for h in s["history"])
+            mins = sum(h.get("minutes", 0) for h in s["history"])
+            lines.append(f"| {t['id']} {t['title']} | {s['status']} | {s['attempts']} ({fix}) | "
+                         f"{last.get('model', '-')} / {last.get('effort', '-')} | {fmt_dur(mins * 60)} | "
+                         f"${s['cost_usd']:.2f} | {note} |")
         blocked = [(t, self.state["tasks"][t["id"]]) for t in self.plan["tasks"]
                    if self.state["tasks"][t["id"]]["status"] in ("blocked", "failed")]
         if blocked:
@@ -971,12 +1104,13 @@ def main():
             return
         st = json.loads(state_path.read_text(encoding="utf-8"))
         if args.sessions:
-            print(f"{'TASK':<7}{'#':<3}{'MODEL':<20}{'EFFORT':<8}{'STARTED':<20}{'TIME':>7} {'COST':>8}  {'OUTCOME':<16}SESSION")
+            print(f"{'TASK':<7}{'#':<3}{'FIX':<4}{'MODEL':<20}{'EFFORT':<8}{'STARTED':<20}{'TIME':>7} {'COST':>8}  "
+                  f"{'OUTCOME':<16}SESSION")
             for tid, s in st["tasks"].items():
                 for h in s["history"]:
-                    print(f"{tid:<7}{h['attempt']:<3}{h['model']:<20}{h['effort']:<8}{h.get('started_at', '-'):<20}"
-                          f"{fmt_dur(h['minutes'] * 60):>7} ${h['cost_usd']:>7.2f}  {h.get('outcome', 'running'):<16}"
-                          f"{h.get('session_id') or '-'}")
+                    print(f"{tid:<7}{h['attempt']:<3}{h.get('fixups', 0):<4}{h['model']:<20}{h['effort']:<8}"
+                          f"{h.get('started_at', '-'):<20}{fmt_dur(h['minutes'] * 60):>7} ${h['cost_usd']:>7.2f}  "
+                          f"{h.get('outcome', 'running'):<16}{h.get('session_id') or '-'}")
             print()
         for tid, s in st["tasks"].items():
             t = sum(h["minutes"] for h in s["history"])

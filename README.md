@@ -8,7 +8,7 @@ Hệ thống này chạy tin cậy được qua đêm nhờ ba nguyên tắc.
 
 **Điều phối nằm trong code, không nằm trong Claude.** Thứ tự task, số lần thử, việc nâng model và trạng thái được lưu trong `state.json` và do script Python quản lý. Vì vậy một phiên Claude có crash hay bị giới hạn usage thì cả đêm cũng không hỏng, và chạy lại đúng lệnh cũ sẽ tiếp tục từ chỗ dừng.
 
-**Không tin lời tự báo cáo.** Worker nói "xong" chưa đủ. Script tự chạy các lệnh `verify` (test, typecheck, lint). Với task quan trọng, một phiên Opus chỉ-đọc review diff. Chỉ khi cả hai đều qua thì script mới commit. Nếu fail, worktree được reset về commit tốt gần nhất, lỗi được đưa vào prompt của lần thử sau, và model được nâng lên.
+**Không tin lời tự báo cáo.** Worker nói "xong" chưa đủ. Script tự chạy các lệnh `verify` (test, typecheck, lint). Với task quan trọng, một phiên Opus chỉ-đọc review diff. Chỉ khi cả hai đều qua thì script mới commit. Nếu fail, script trước hết đưa lỗi trở lại **chính phiên worker đó** (`--resume`, context và code dở đã có sẵn nên rẻ và nhanh) để sửa một vòng; chỉ khi vòng sửa đó vẫn fail thì worktree mới được reset về commit tốt gần nhất, lỗi được đưa vào prompt của lần thử sau, và model được nâng lên.
 
 **Không ai hỏi ai.** Worker chạy với `--permission-prompts none`, nên không có công cụ để hỏi bạn. Gặp chỗ mơ hồ thì worker tự chọn theo spec và ghi vào `DECISIONS.md`. Chỉ khi thật sự không thể đi tiếp (spec mâu thuẫn, cần credential, thao tác không thể hoàn tác), worker trả về `blocked` kèm câu hỏi và đề xuất trả lời. Script ghi câu hỏi vào báo cáo, bỏ qua các task phụ thuộc vào nó và vẫn chạy tiếp các nhánh việc khác.
 
@@ -83,9 +83,17 @@ Khi `autopilot run` chạy trong một pane herdr (`HERDR_ENV=1`), nó tự làm
 
 ## Chọn model và effort
 
-Model mạnh (lúc lập plan) gán `model` và `effort` cho từng task theo bảng trong skill: Haiku cho việc cơ học đã được đặc tả đầy đủ, Sonnet/medium cho feature thông thường, Sonnet/high cho logic khó nhiều file, Opus/high cho kiến trúc, migration, concurrency, bảo mật, bước tích hợp và review cuối. Nguyên tắc là chọn mức rẻ nhất có khả năng thành công, vì khi thất bại script tự leo thang: lần thử thứ hai lên model kế tiếp (Haiku → Sonnet → Opus, effort tối thiểu `high`); khi đã ở Opus thì tăng effort. Muốn kiểm soát riêng cho một task thì đặt `escalate_to`.
+Model mạnh (lúc lập plan) gán `model` và `effort` cho từng task theo bảng trong skill: Haiku cho việc cơ học đã được đặc tả đầy đủ, Sonnet/medium cho feature thông thường, Sonnet/high cho logic khó nhiều file, Opus/high cho kiến trúc, migration, concurrency, bảo mật, bước tích hợp và review cuối. Nguyên tắc là chọn mức rẻ nhất có khả năng thành công, vì khi thất bại script tự leo thang theo hai bậc. Bậc một là **vòng sửa (fix-up)**: lỗi verify, ý kiến của reviewer hay lỗi commit hook được gửi lại cho đúng phiên worker vừa làm, với cùng model và thêm một khoản ngân sách nhỏ (`fixup_budget_usd`); phiên đó đã có context và code dở nên thường sửa xong trong vài phút. Bậc hai, chỉ khi vòng sửa vẫn fail: reset worktree và chạy lần thử mới với model kế tiếp (Haiku → Sonnet → Opus, effort tối thiểu `high`); khi đã ở Opus thì tăng effort. Muốn kiểm soát riêng cho một task thì đặt `escalate_to`, hoặc `fixups: 0` để bỏ bậc một.
 
 Để kiểm tra trước, `autopilot run ... --dry-run` in ra model và effort của lần đầu và lần retry cho từng task.
+
+### Những gì script làm để tiết kiệm thời gian và chi phí
+
+- **Vòng sửa trước khi leo thang** (ở trên). Một task Sonnet gần xong mà fail một test không còn bị vứt đi để chạy lại từ đầu bằng Opus.
+- **Spec được dán thẳng vào prompt.** Nếu `SPEC.md` không quá `inline_spec_kb` (mặc định 48 KB), worker nhận SPEC, đuôi của PROGRESS.md và DECISIONS.md ngay trong task message, bớt ba lượt gọi tool đọc file ở đầu mỗi task.
+- **Reviewer không nuốt cả diff.** Diff dán vào prompt reviewer bị cắt ở `review_inline_diff_kb` (mặc định 120 KB); phần còn lại reviewer tự lấy bằng `git diff` cho từng file theo diff stat, thay vì đổ hàng trăm KB vào Opus.
+- **Chờ giới hạn usage đúng bằng thời gian cần chờ.** Nếu thông báo giới hạn có ghi thời điểm reset ("resets at 3am", "try again in 25 minutes") thì script ngủ đúng chừng đó (cộng một phút, tối đa 6 giờ) thay vì cố định `limit_wait_minutes`. Hết `max_limit_waits` mà vẫn bị giới hạn thì run dừng và giữ task ở trạng thái pending, không đốt một lần thử rồi leo lên Opus vì lý do không phải lỗi code.
+- Báo cáo và `autopilot status --sessions` có thêm cột thời gian và số vòng sửa của từng task, để bạn thấy task nào ngốn thời gian và điều chỉnh model cho lần plan sau.
 
 ## Các trường trong tasks.json
 
@@ -95,7 +103,10 @@ Model mạnh (lúc lập plan) gán `model` và `effort` cho từng task theo b�
 | `defaults.setup` | Chạy một lần khi tạo worktree, ví dụ copy `.env` và `npm ci`. |
 | `defaults.permission_mode` | Mặc định `auto` (classifier duyệt từng hành động). Xem phần an toàn bên dưới. |
 | `defaults.max_budget_usd` | Trần chi phí mỗi phiên worker, truyền vào `--max-budget-usd`. |
-| `defaults.limit_wait_minutes` / `max_limit_waits` | Gặp giới hạn usage thì ngủ rồi `--resume` đúng phiên đó. |
+| `defaults.limit_wait_minutes` / `max_limit_waits` | Gặp giới hạn usage thì ngủ rồi `--resume` đúng phiên đó. Nếu thông báo có ghi giờ reset thì ngủ đúng chừng đó; `limit_wait_minutes` chỉ là mức dự phòng. Hết `max_limit_waits` thì run dừng, task giữ pending. |
+| `defaults.fixups` / `fixup_budget_usd` / `fixup_timeout_minutes` | Số vòng sửa trong cùng phiên worker trước khi reset và leo thang (mặc định 1, thêm $4 và 30 phút mỗi vòng). `task.fixups` ghi đè cho từng task; `0` để tắt. |
+| `defaults.inline_spec_kb` | Dán SPEC.md (và đuôi PROGRESS/DECISIONS) vào prompt khi SPEC không quá kích thước này (mặc định 48). `0` để worker luôn tự đọc file. |
+| `defaults.review_inline_diff_kb` | Cắt diff dán cho reviewer ở kích thước này (mặc định 120); reviewer dùng `git diff` cho phần còn lại. |
 | `task.depends_on` | Task phụ thuộc. Phụ thuộc fail hoặc blocked thì task này bị skip, các nhánh khác vẫn chạy. |
 | `task.verify` | Lệnh kiểm tra riêng của task, chạy thêm vào `defaults.verify`. |
 | `task.review` | `true` thì một phiên reviewer (mặc định Opus/high, chỉ đọc) phải approve diff. |
