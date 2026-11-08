@@ -39,6 +39,8 @@ import threading
 import time
 from pathlib import Path
 
+__version__ = "0.1.0"  # single source of truth; bump per release (see CHANGELOG.md)
+
 KIT_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = KIT_DIR / "prompts"
 
@@ -1078,6 +1080,7 @@ def launch_in_herdr(args, tasks_path: Path):
 def main():
     ap = argparse.ArgumentParser(prog="autopilot", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-V", "--version", action="version", version=f"autopilot {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
     v = sub.add_parser("validate")
     v.add_argument("tasks")
