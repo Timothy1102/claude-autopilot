@@ -90,13 +90,16 @@ Set `review: true` on tasks where a wrong-but-green result would be costly (auth
 }
 ```
 
-`setup` runs once, inside the new git worktree the orchestrator creates next to the repo (`../<repo>.autopilot-<plan-id>`), so copy any untracked files the tests need (such as `.env`) and install dependencies there.
+`setup` runs once, inside the new git worktree the orchestrator creates next to the repo (`../<repo>.autopilot-<plan-id>`), so copy any untracked files the tests need (such as `.env`) and install dependencies there. A fresh worktree has no build output (`dist/`, generated clients), so build workspace packages before any step that imports them (e.g. DB seeding). If setup fails it is retried on the next run.
 
 ## Phase 5 — Validate and hand off
 
 1. Run `autopilot validate .autopilot/<plan-id>/tasks.json` and fix every error. Treat warnings about missing `verify` or `acceptance` as errors unless the human agrees otherwise.
 2. Run `autopilot run .autopilot/<plan-id>/tasks.json --dry-run` and show the human the task table with models, efforts and dependencies.
 3. Re-read SPEC.md as if you were a worker who has never seen this conversation. Fix anything a worker would need to ask about.
-4. Tell the human the command to start the run, for example:
-   `autopilot run .autopilot/<plan-id>/tasks.json --max-total-usd 60 --notify-cmd "<their notifier>"`
-   and remind them to start it inside tmux or another session that survives logging out.
+4. Hand off the run. The run must live in a herdr workspace, so it survives closing the terminal or dropping SSH, and so its state shows in the herdr sidebar.
+   - Show the human the command, for example:
+     `autopilot herdr .autopilot/<plan-id>/tasks.json --max-total-usd 60`
+     It creates a herdr workspace named `autopilot <plan-id>`, starts the run in it and returns immediately.
+   - If `HERDR_ENV=1` (this session is itself running inside herdr), offer to run that command for the human. Run it only after they say yes, because it starts spending their usage.
+   - If herdr is not running or not installed, tell them to start `herdr` first, or to run `autopilot run …` directly in any terminal that will stay open.

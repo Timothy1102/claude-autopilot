@@ -15,3 +15,8 @@ echo "Installed:"
 echo "  CLI   -> $BIN_DIR/autopilot (make sure $BIN_DIR is on your PATH)"
 echo "  Skill -> $SKILLS_DIR/autopilot-plan (use /autopilot-plan in Claude Code)"
 command -v claude >/dev/null && echo "  claude $(claude --version)" || echo "  warning: 'claude' not found on PATH"
+if command -v herdr >/dev/null; then
+  echo "  herdr  $(herdr --version)"
+else
+  echo "  note: herdr not found. For overnight runs install it: brew install herdr (https://herdr.dev)"
+fi

@@ -12,8 +12,14 @@ Usage:
   autopilot validate <tasks.json>
   autopilot run      <tasks.json> [--dry-run] [--retry-failed] [--only T03,T04]
                                   [--max-total-usd 40] [--notify-cmd "..."]
-                                  [--force-clean] [--claude-bin claude]
+                                  [--force-clean] [--no-hold] [--claude-bin claude]
+  autopilot herdr    <tasks.json> [same options as run]   # start the run in a new herdr workspace
   autopilot status   <tasks.json>
+
+Inside a herdr pane (HERDR_ENV=1) the run reports its state to the herdr sidebar
+(working / blocked / done), registers a resume command so herdr restarts it after
+a server restart, sends a herdr notification at the end, and stays open so the
+final state is still visible when you come back.
 
 Python 3.9+, standard library only.
 """
@@ -22,10 +28,14 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -50,6 +60,7 @@ DEFAULTS = {
     "limit_wait_minutes": 30,       # sleep when a usage/rate limit is hit
     "max_limit_waits": 16,
     "extra_args": [],               # appended to every `claude` call
+    "stream": True,                 # stream-json: live view of what each worker is doing
 }
 
 # Workers must never touch git history; the orchestrator owns commits.
@@ -111,10 +122,21 @@ class Logger:
                 f.write(line + "\n")
 
 
+def child_env() -> dict:
+    """Environment for workers, verify and setup commands.
+
+    HERDR_* variables are removed so that herdr's Claude Code integration hooks
+    (if installed) don't fire inside `claude -p` workers and overwrite the state
+    that autopilot itself reports for its pane.
+    """
+    return {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
+
+
 def run(cmd, cwd, check=True, timeout=None, input_text=None, shell=False):
     p = subprocess.run(
         cmd, cwd=str(cwd), input=input_text, capture_output=True, text=True,
         timeout=timeout, shell=shell, executable="/bin/bash" if shell else None,
+        env=child_env(),
     )
     if check and p.returncode != 0:
         raise RuntimeError(f"command failed ({p.returncode}): {cmd}\n{p.stdout}\n{p.stderr}")
@@ -133,6 +155,88 @@ def parse_json_output(stdout: str):
         except Exception:  # noqa: BLE001
             continue
     return None
+
+
+def parse_stream_result(lines):
+    """Return the final `result` event from stream-json output, if any."""
+    for line in reversed(lines):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            return obj
+    return None
+
+
+def describe_event(ev: dict):
+    """One short human-readable line per worker event, for the live view."""
+    if ev.get("type") != "assistant":
+        return []
+    indent = "    ↳ " if ev.get("parent_tool_use_id") else ""
+    out = []
+    for block in (ev.get("message") or {}).get("content") or []:
+        if block.get("type") == "text" and block.get("text", "").strip():
+            txt = " ".join(block["text"].split())
+            out.append(f"{indent}💬 {txt[:160]}")
+        elif block.get("type") == "tool_use":
+            inp = block.get("input") or {}
+            detail = next((str(inp[k]) for k in ("description", "command", "file_path", "pattern", "path",
+                                                   "url", "query", "prompt") if inp.get(k)), "")
+            detail = " ".join(detail.split())[:110]
+            out.append(f"{indent}🔧 {block.get('name', '?')} {detail}".rstrip())
+    return out
+
+
+class Herdr:
+    """Best-effort reporting to herdr (https://herdr.dev) when running inside a herdr pane."""
+
+    SOURCE = "autopilot"
+    AGENT = "autopilot"
+
+    def __init__(self, disabled=False):
+        self.bin = os.environ.get("HERDR_BIN_PATH")
+        self.pane = os.environ.get("HERDR_PANE_ID")
+        self.enabled = (not disabled and os.environ.get("HERDR_ENV") == "1"
+                        and bool(self.bin) and bool(self.pane))
+
+    def _call(self, *args):
+        if not self.enabled:
+            return None
+        try:
+            return subprocess.run([self.bin, *args], capture_output=True, text=True, timeout=10)
+        except Exception:  # noqa: BLE001  — herdr must never break the run
+            return None
+
+    @staticmethod
+    def _seq():
+        return str(time.time_ns() // 1000)
+
+    def report(self, state, message=None, resume_argv=None):
+        args = ["pane", "report-agent", self.pane, "--source", self.SOURCE, "--agent", self.AGENT,
+                "--state", state, "--seq", self._seq()]
+        if message:
+            args += ["--message", message[:200]]
+        if resume_argv:
+            args += ["--"] + resume_argv
+        self._call(*args)
+
+    def title(self, text, summary=None):
+        args = ["pane", "report-metadata", self.pane, "--source", "autopilot-display",
+                "--title", text[:80], "--seq", self._seq()]
+        if summary:
+            args += ["--token", f"summary={summary[:80]}"]
+        self._call(*args)
+
+    def notify(self, title, body, sound="done"):
+        self._call("notification", "show", title[:80], "--body", body[:300], "--sound", sound)
+
+    def release(self):
+        self._call("pane", "release-agent", self.pane, "--source", self.SOURCE, "--agent", self.AGENT,
+                   "--seq", self._seq())
 
 
 def git(cwd, *args, check=True) -> str:
@@ -240,8 +344,11 @@ class Runner:
         self.wt = self.repo.parent / f"{self.repo.name}.autopilot-{self.pid}"
         self.branch = f"autopilot/{self.pid}"
         self.state_path = self.run_dir / "state.json"
+        self.crashed = False            # set by _load_state when a task was mid-run last time
         self.state = self._load_state()
         self.claude = args.claude_bin
+        self.herdr = Herdr(disabled=args.dry_run)
+        self.current = ""               # short description of what is running, for herdr
 
     # ---- state
     def _load_state(self):
@@ -253,6 +360,7 @@ class Runner:
             s = st["tasks"].setdefault(t["id"], {"status": "pending", "attempts": 0, "cost_usd": 0.0, "history": []})
             if s["status"] == "running":
                 s["status"] = "pending"
+                self.crashed = True
             if getattr(self.args, "retry_failed", False) and s["status"] in ("failed", "blocked", "skipped"):
                 s.update(status="pending", attempts=0)
                 s.pop("reason", None)
@@ -286,11 +394,17 @@ class Runner:
                 git(self.repo, "worktree", "add", "-b", self.branch, str(self.wt), base)
             created = True
             self.log(f"created worktree {self.wt} on branch {self.branch} (from {base})")
-        elif git(self.wt, "status", "--porcelain") and not self.args.force_clean:
-            raise SystemExit(
-                f"Worktree {self.wt} has uncommitted changes. Commit them there yourself, "
-                "or rerun with --force-clean to discard them."
-            )
+        elif git(self.wt, "status", "--porcelain"):
+            if self.crashed or self.args.force_clean:
+                # Leftovers of an unverified attempt from a run that was killed (e.g. herdr server
+                # restart or reboot); they were never committed, so discarding them is safe.
+                self.log("discarding uncommitted leftovers from the interrupted attempt")
+                self.reset_clean()
+            else:
+                raise SystemExit(
+                    f"Worktree {self.wt} has uncommitted changes. Commit them there yourself, "
+                    "or rerun with --force-clean to discard them."
+                )
 
         self.wt_plan = self.wt / self.rel
         self.wt_plan.mkdir(parents=True, exist_ok=True)
@@ -310,34 +424,92 @@ class Runner:
         if run(["git", "diff", "--cached", "--quiet"], self.wt, check=False).returncode != 0:
             git(self.wt, "commit", "-m", f"autopilot({self.pid}): sync plan")
 
-        if created:
+        # A failed setup leaves a half-prepared worktree; remember that so the next run retries it
+        # instead of silently skipping setup because the worktree already exists.
+        marker = Path(git(self.wt, "rev-parse", "--absolute-git-dir")) / "autopilot-setup-failed"
+        if created or marker.exists():
+            if not created:
+                self.log("previous setup failed; running setup again")
+            marker.write_text("setup did not complete\n")
             for cmd in self.d["setup"]:
                 self.log(f"setup: {cmd}")
                 p = run(cmd, self.wt, check=False, shell=True, timeout=self.d["verify_timeout_minutes"] * 60)
                 if p.returncode != 0:
-                    raise SystemExit(f"setup command failed: {cmd}\n{tail(p.stdout + p.stderr)}")
+                    raise SystemExit(f"setup command failed: {cmd}\n{tail(p.stdout + p.stderr)}\n"
+                                     "Fix the setup command and rerun; setup will be retried.")
+            marker.unlink()
 
     def reset_clean(self):
         git(self.wt, "reset", "--hard", "-q", "HEAD")
         git(self.wt, "clean", "-fdq")
 
     # ---- claude
+    def _spawn(self, cmd, text_in, out_path, timeout_s, live):
+        """Run a worker, tee its stdout to out_path, print a live view, kill the group on timeout."""
+        err_path = out_path.with_suffix(".stderr.txt")
+        with open(err_path, "w", encoding="utf-8") as err_f, open(out_path, "w", encoding="utf-8") as out_f:
+            proc = subprocess.Popen(cmd, cwd=str(self.wt), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=err_f, text=True, env=child_env(), start_new_session=True)
+            timed_out = threading.Event()
+
+            def kill():
+                timed_out.set()
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    time.sleep(10)
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+            timer = threading.Timer(timeout_s, kill)
+            timer.daemon = True
+            timer.start()
+            try:
+                proc.stdin.write(text_in)
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+            lines = []
+            live_log = self.run_dir / "live.log"
+            with open(live_log, "a", encoding="utf-8") as live_f:
+                for line in proc.stdout:
+                    lines.append(line)
+                    out_f.write(line)
+                    if not live or not line.startswith("{"):
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for msg in describe_event(ev):
+                        print(f"   │ {msg}", flush=True)
+                        live_f.write(f"[{ts()}] {self.current} {msg}\n")
+            proc.wait()
+            timer.cancel()
+        stderr = err_path.read_text(encoding="utf-8")
+        if timed_out.is_set():
+            return -1, lines, stderr + "\nTIMEOUT: worker exceeded its time limit"
+        return proc.returncode, lines, stderr
+
     def claude_call(self, *, prompt, model, effort, schema, rules_file, budget, tag,
                     permission_mode=None, allowed_tools=None, timeout_min=None):
         """Runs claude -p; waits and resumes on usage/rate limits. Returns (data|None, raw, cost_delta)."""
         resume_sid, waits, cost, prev_total = None, 0, 0.0, 0.0
         while True:
+            stream = bool(self.d.get("stream", True))
             cmd = [
                 self.claude, "-p",
                 "--model", model, "--effort", effort,
                 "--permission-mode", permission_mode or self.d["permission_mode"],
                 "--permission-prompts", "none",
-                "--output-format", "json",
+                "--output-format", "stream-json" if stream else "json",
                 "--json-schema", json.dumps(schema),
                 "--append-system-prompt-file", str(rules_file),
                 "--max-budget-usd", str(budget),
                 "--disallowedTools", DENIED_TOOLS,
             ]
+            if stream:
+                cmd.append("--verbose")
             if allowed_tools:
                 cmd += ["--allowedTools", allowed_tools]
             cmd += list(self.d["extra_args"])
@@ -345,32 +517,32 @@ class Runner:
             if resume_sid:
                 cmd += ["--resume", resume_sid]
                 text_in = "You were interrupted by a usage/rate limit. Continue the task exactly where you left off."
-            n = len(list((self.run_dir / "logs").glob(f"{tag}*.json"))) if (self.run_dir / "logs").exists() else 0
-            out_path = self.run_dir / "logs" / f"{tag}-{n}.json"
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                p = subprocess.run(cmd, cwd=str(self.wt), input=text_in, capture_output=True, text=True,
-                                   timeout=(timeout_min or self.d["timeout_minutes"]) * 60)
-                rc, stdout, stderr = p.returncode, p.stdout, p.stderr
-            except subprocess.TimeoutExpired as e:
-                rc, stdout, stderr = -1, (e.stdout or "") if isinstance(e.stdout, str) else "", "TIMEOUT"
-            out_path.write_text(stdout or "", encoding="utf-8")
-            if stderr:
-                out_path.with_suffix(".stderr.txt").write_text(stderr, encoding="utf-8")
-
-            data = parse_json_output(stdout)
+            logs = self.run_dir / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
+            n = len(list(logs.glob(f"{tag}-*.jsonl")))
+            out_path = logs / f"{tag}-{n}.jsonl"
+            rc, lines, stderr = self._spawn(cmd, text_in, out_path,
+                                            (timeout_min or self.d["timeout_minutes"]) * 60, live=stream)
+            stdout = "".join(lines)
+            data = parse_stream_result(lines) if stream else None
+            if data is None:
+                data = parse_json_output(stdout)
             if isinstance(data, dict):
                 total = float(data.get("total_cost_usd") or 0)
                 cost += max(total - prev_total, 0) if resume_sid else total
                 prev_total = total
             raw = f"{stdout}\n{stderr}"
             errored = rc != 0 or (isinstance(data, dict) and data.get("is_error"))
-            if errored and LIMIT_RE.search(tail(raw, 4000)) and waits < self.d["max_limit_waits"]:
+            # Only look for limit messages in stderr and the final result, never in tool output
+            # (a worker reading code about rate limiting must not look like a usage limit).
+            limit_text = stderr + "\n" + "".join(lines[-2:]) + "\n" + str((data or {}).get("result", ""))
+            if errored and LIMIT_RE.search(tail(limit_text, 4000)) and waits < self.d["max_limit_waits"]:
                 waits += 1
                 if isinstance(data, dict) and data.get("session_id"):
                     resume_sid = data["session_id"]
                 self.log(f"{tag}: usage/rate limit hit, sleeping {self.d['limit_wait_minutes']} min "
                          f"(wait {waits}/{self.d['max_limit_waits']})")
+                self.herdr.report("working", f"{self.current}: waiting for usage limit reset")
                 time.sleep(self.d["limit_wait_minutes"] * 60)
                 continue
             if errored:
@@ -446,6 +618,8 @@ class Runner:
             self.reset_clean()
             start_head = git(self.wt, "rev-parse", "HEAD")
             self.log(f"{tid} attempt {attempt}: {model} / {effort}")
+            self.current = f"{tid} a{attempt}"
+            self.herdr_progress(f"{tid} {task['title']} · attempt {attempt} · {model.replace('claude-', '')}/{effort}")
             started = time.time()
             data, raw, cost = self.claude_call(
                 prompt=self.build_prompt(task, feedback), model=model, effort=effort,
@@ -548,6 +722,9 @@ class Runner:
         if version.returncode != 0:
             raise SystemExit(f"cannot run '{self.claude} --version'")
         self.log(f"claude {version.stdout.strip()} — starting plan {self.pid}")
+        if self.herdr.enabled:
+            self.log(f"herdr detected (pane {self.herdr.pane}): reporting state to the sidebar")
+        self.herdr_progress("preparing worktree")
         self.ensure_worktree()
         self.save()
         try:
@@ -570,6 +747,7 @@ class Runner:
                         self.log(f"total budget ${self.args.max_total_usd} reached; stopping")
                         raise StopIteration
                     self.run_task(t)
+                    self.herdr_progress(f"{t['id']} {self.state['tasks'][t['id']]['status']}")
                     progressed = True
                     break
                 if not progressed:
@@ -582,18 +760,76 @@ class Runner:
                     s["status"] = "pending"
             self.save()
             self.log("interrupted; state saved, rerun the same command to resume")
+            self.herdr.release()
             sys.exit(130)
         self.save()
-        self.log(f"finished. Report: {self.run_dir / 'REPORT.md'}")
+        summary = self.short_summary()
+        self.log(f"finished. {summary}. Report: {self.run_dir / 'REPORT.md'}")
         if self.args.notify_cmd:
-            run(self.args.notify_cmd, self.repo, check=False, shell=True, input_text=self.short_summary())
+            run(self.args.notify_cmd, self.repo, check=False, shell=True, input_text=summary)
+        self.finish_in_herdr(summary)
+
+    # ---- herdr
+    def resume_argv(self):
+        """Command herdr re-runs in this pane after a herdr server restart (no apostrophes allowed)."""
+        a = self.args
+        argv = ["autopilot", "run", str(self.tasks_path)]
+        if a.only:
+            argv += ["--only", a.only]
+        if a.max_total_usd:
+            argv += ["--max-total-usd", str(a.max_total_usd)]
+        if a.notify_cmd and "'" not in a.notify_cmd:
+            argv += ["--notify-cmd", a.notify_cmd]
+        if a.no_hold:
+            argv.append("--no-hold")
+        if a.claude_bin != "claude" and "/" not in a.claude_bin:
+            argv += ["--claude-bin", a.claude_bin]
+        if any("'" in x or any(ord(c) < 32 for c in x) for x in argv) or len(" ".join(argv)) > 8000:
+            return None
+        return argv
+
+    def counts(self):
+        c = {}
+        for s in self.state["tasks"].values():
+            c[s["status"]] = c.get(s["status"], 0) + 1
+        return c
+
+    def herdr_progress(self, message):
+        if not self.herdr.enabled:
+            return
+        c, total = self.counts(), len(self.plan["tasks"])
+        summary = f"{c.get('done', 0)}/{total} done · ${self.state['total_cost_usd']:.2f}"
+        self.herdr.report("working", message, resume_argv=self.resume_argv())
+        self.herdr.title(f"autopilot {self.pid} · {summary}", summary=summary)
+
+    def finish_in_herdr(self, summary):
+        if not self.herdr.enabled:
+            return
+        c = self.counts()
+        needs_you = c.get("failed", 0) + c.get("blocked", 0)
+        if needs_you:
+            msg = f"{needs_you} task(s) need you: see {self.rel.as_posix()}/run/REPORT.md"
+            self.herdr.report("blocked", msg, resume_argv=self.resume_argv())
+            self.herdr.notify(f"autopilot {self.pid} needs you", summary, sound="request")
+        else:
+            self.herdr.report("idle", "all tasks done", resume_argv=self.resume_argv())
+            self.herdr.notify(f"autopilot {self.pid} finished", summary, sound="done")
+        self.herdr.title(f"autopilot {self.pid} · {summary.split(': ', 1)[-1]}")
+        if self.args.no_hold or not sys.stdin.isatty():
+            self.herdr.release()
+            return
+        # Stay in the pane so the sidebar keeps showing done/blocked until you have looked at it.
+        print(f"\nRun finished — {summary}\nReport: {self.run_dir / 'REPORT.md'}\n"
+              f"Worktree: {self.wt}\nPress Enter to close this autopilot pane.", flush=True)
+        try:
+            input()
+        except (EOFError, KeyboardInterrupt):
+            pass
+        self.herdr.release()
 
     # ---- reporting
     def short_summary(self):
-        counts = {}
-        for s in self.state["tasks"].values():
-            counts[s["status"]] = counts.get(s["status"], 0) + 1
-        parts = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
+        parts = ", ".join(f"{v} {k}" for k, v in sorted(self.counts().items()))
         return f"autopilot {self.pid}: {parts}; ${self.state['total_cost_usd']:.2f}"
 
     def write_report(self):
@@ -631,21 +867,74 @@ class Runner:
 
 # --------------------------------------------------------------------------- cli
 
+def add_run_options(p):
+    p.add_argument("tasks")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--retry-failed", action="store_true", help="reset failed/blocked/skipped tasks to pending")
+    p.add_argument("--only", help="comma-separated task ids")
+    p.add_argument("--max-total-usd", type=float, default=0.0)
+    p.add_argument("--notify-cmd", help="shell command; receives a one-line summary on stdin when the run ends")
+    p.add_argument("--force-clean", action="store_true", help="discard uncommitted changes in the worktree")
+    p.add_argument("--no-hold", action="store_true", help="inside herdr: exit when done instead of waiting for Enter")
+    p.add_argument("--claude-bin", default="claude")
+
+
+def passthrough(args):
+    out = []
+    for flag in ("retry_failed", "force_clean", "no_hold", "dry_run"):
+        if getattr(args, flag):
+            out.append("--" + flag.replace("_", "-"))
+    for flag in ("only", "notify_cmd"):
+        if getattr(args, flag):
+            out += ["--" + flag.replace("_", "-"), getattr(args, flag)]
+    if args.max_total_usd:
+        out += ["--max-total-usd", str(args.max_total_usd)]
+    if args.claude_bin != "claude":
+        out += ["--claude-bin", args.claude_bin]
+    return out
+
+
+def launch_in_herdr(args, tasks_path: Path):
+    """Create a herdr workspace for this plan and start `autopilot run` in its root pane."""
+    herdr = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
+    if not herdr:
+        raise SystemExit("herdr not found. Install it from https://herdr.dev (brew install herdr).")
+    plan, _, errors, _ = load_plan(tasks_path)
+    if errors:
+        raise SystemExit("Plan is invalid:\n  " + "\n  ".join(errors))
+    repo = Path(git(tasks_path.parent, "rev-parse", "--show-toplevel"))
+    me = ["autopilot"] if shutil.which("autopilot") else [sys.executable, str(Path(__file__).resolve())]
+    cmd = shlex.join(me + ["run", str(tasks_path)] + passthrough(args))
+
+    created = subprocess.run([herdr, "workspace", "create", "--cwd", str(repo),
+                              "--label", f"autopilot {plan['plan_id']}", "--no-focus"],
+                             capture_output=True, text=True)
+    if created.returncode != 0:
+        raise SystemExit("Could not create a herdr workspace. Is the herdr server running? "
+                         "Start it with `herdr` (or `herdr server` for a headless one).\n"
+                         + created.stdout + created.stderr)
+    try:
+        pane = json.loads(created.stdout)["result"]["root_pane"]["pane_id"]
+    except Exception:  # noqa: BLE001
+        raise SystemExit("Unexpected response from `herdr workspace create`:\n" + created.stdout)
+    started = subprocess.run([herdr, "pane", "run", pane, cmd], capture_output=True, text=True)
+    if started.returncode != 0:
+        raise SystemExit("`herdr pane run` failed:\n" + started.stdout + started.stderr)
+    print(f"Started in herdr workspace 'autopilot {plan['plan_id']}' (pane {pane}).\n"
+          f"  watch:   open herdr and select that workspace\n"
+          f"  peek:    herdr pane read {pane} --source recent --lines 40\n"
+          f"  report:  {tasks_path.parent / 'run' / 'REPORT.md'}\n"
+          "You can close this terminal; the run lives in the herdr server.")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="autopilot", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     v = sub.add_parser("validate")
     v.add_argument("tasks")
-    r = sub.add_parser("run")
-    r.add_argument("tasks")
-    r.add_argument("--dry-run", action="store_true")
-    r.add_argument("--retry-failed", action="store_true", help="reset failed/blocked/skipped tasks to pending")
-    r.add_argument("--only", help="comma-separated task ids")
-    r.add_argument("--max-total-usd", type=float, default=0.0)
-    r.add_argument("--notify-cmd", help="shell command; receives a one-line summary on stdin when the run ends")
-    r.add_argument("--force-clean", action="store_true", help="discard uncommitted changes in the worktree")
-    r.add_argument("--claude-bin", default="claude")
+    add_run_options(sub.add_parser("run", help="run the plan in this terminal"))
+    add_run_options(sub.add_parser("herdr", help="start the run in a new herdr workspace and return"))
     s = sub.add_parser("status")
     s.add_argument("tasks")
     args = ap.parse_args()
@@ -668,6 +957,9 @@ def main():
         for tid, s in st["tasks"].items():
             print(f"{tid:<8} {s['status']:<8} attempts={s['attempts']} ${s['cost_usd']:.2f}")
         print(f"total ${st['total_cost_usd']:.2f}")
+        return
+    if args.cmd == "herdr":
+        launch_in_herdr(args, tasks_path)
         return
     if args.cmd == "run":
         if not args.dry_run and not shutil.which(args.claude_bin) and not Path(args.claude_bin).exists():

@@ -21,34 +21,65 @@ git clone <nơi bạn lưu kit này> ~/.claude-autopilot   # hoặc giải nén 
 
 Lệnh trên tạo lệnh `autopilot` trong `~/.local/bin` và cài skill `/autopilot-plan` vào `~/.claude/skills/`, nên dùng được ở mọi project. Yêu cầu: Claude Code v2.1.259 trở lên (cần cho flag `--permission-prompts`), Python 3.9+, git, và macOS, Linux hoặc WSL.
 
-## Quy trình mỗi task lớn
-
-**1. Lập plan (bạn có mặt, khoảng 20–60 phút).** Trong repo, mở phiên mạnh nhất:
+Cài thêm [herdr](https://herdr.dev) để chạy qua đêm (khuyến nghị):
 
 ```bash
+brew install herdr                     # hoặc: curl -fsSL https://herdr.dev/install.sh | sh
+herdr integration install claude       # để herdr hiện trạng thái phiên Claude lập plan
+```
+
+Mặc định herdr không bật popup thông báo. Muốn sáng dậy thấy thông báo, thêm vào `~/.config/herdr/config.toml` rồi chạy `herdr server reload-config`:
+
+```toml
+[ui.toast]
+delivery = "system"   # hoặc "herdr" để hiện toast trong giao diện herdr
+```
+
+## Quy trình mỗi task lớn
+
+**1. Lập plan (bạn có mặt, khoảng 20–60 phút).** Mở herdr ở repo, rồi mở phiên mạnh nhất trong một pane:
+
+```bash
+cd ~/code/myrepo && herdr
 claude --model claude-opus-5-5 --effort xhigh
 > /autopilot-plan Viết lại module billing theo hướng invoice-based, ...
 ```
 
 Skill sẽ đọc codebase, chạy thử test để chắc baseline đang xanh, rồi hỏi bạn từng nhóm quyết định (luôn kèm phương án đề xuất). Sau đó nó viết `.autopilot/<plan-id>/SPEC.md` và `tasks.json`, gán model và effort cho từng task, chạy `autopilot validate` và `--dry-run` cho bạn xem. Đây là bước duy nhất cần bạn. Thời gian bỏ ra ở đây quyết định chất lượng cả đêm.
 
-**2. Chạy (bạn đi ngủ).** Chạy trong tmux để không chết khi đóng terminal:
+**2. Chạy (bạn đi ngủ).** Cuối phiên lập plan, skill sẽ đưa lệnh này (và hỏi có muốn nó chạy giúp không):
 
 ```bash
-tmux new -s autopilot
-autopilot run .autopilot/billing-v2/tasks.json --max-total-usd 60 \
-  --notify-cmd 'curl -s -d @- ntfy.sh/<topic-riêng-của-bạn>'
+autopilot herdr .autopilot/billing-v2/tasks.json --max-total-usd 60
 ```
+
+Lệnh này tạo một workspace herdr tên `autopilot billing-v2`, chạy `autopilot run` trong đó rồi trả về ngay. Bạn có thể đóng terminal, gập laptop hay mất SSH: run vẫn sống trong herdr server. Nếu bạn đang ở trong một pane herdr, gõ thẳng `autopilot run …` ở pane đó cũng được.
 
 Script tạo một git worktree riêng ở `../<repo>.autopilot-<plan-id>` trên branch `autopilot/<plan-id>`, nên checkout chính của bạn không bị đụng tới và bạn vẫn làm việc khác được. Mỗi task thành công là một commit.
 
-**3. Sáng hôm sau.** Đọc `.autopilot/<plan-id>/run/REPORT.md`, có bảng trạng thái, chi phí, và mục "Needs you" liệt kê câu hỏi cùng lỗi cuối. Review bằng `git log` / `git diff main...autopilot/<plan-id>`. Nếu có câu hỏi, bổ sung quyết định vào `SPEC.md` (hoặc sửa `tasks.json`) trong checkout chính, rồi chạy:
+**3. Sáng hôm sau.** Mở `herdr`. Sidebar cho biết ngay kết quả: workspace autopilot hiện **done** nếu mọi task xong, hoặc **blocked** nếu có task cần bạn. Pane autopilot vẫn mở, giữ nguyên log và đường dẫn tới báo cáo; nhấn Enter khi xem xong. Đọc `.autopilot/<plan-id>/run/REPORT.md`, có bảng trạng thái, chi phí, và mục "Needs you" liệt kê câu hỏi cùng lỗi cuối. Review bằng `git log` / `git diff main...autopilot/<plan-id>`. Nếu có câu hỏi, bổ sung quyết định vào `SPEC.md` (hoặc sửa `tasks.json`) trong checkout chính, rồi chạy:
 
 ```bash
 autopilot run .autopilot/billing-v2/tasks.json --retry-failed
 ```
 
 Hài lòng thì merge hoặc mở PR từ branch đó.
+
+## Chạy với herdr
+
+Khi `autopilot run` chạy trong một pane herdr (`HERDR_ENV=1`), nó tự làm thêm mấy việc sau, không cần cấu hình.
+
+**Báo trạng thái lên sidebar.** Pane được báo là `working` kèm dòng mô tả như "T03 Invoice service · attempt 2 · sonnet-5-5/high", và tiêu đề pane hiện tiến độ kiểu "3/7 done · $4.20". Khi kết thúc, pane chuyển sang `done`, hoặc `blocked` nếu có task fail hay đang chờ câu hỏi; herdr phát âm thanh và thông báo tương ứng. Vì là trạng thái agent thật, bạn cũng có thể đợi nó từ script: `herdr agent wait <pane-id> --until idle --until blocked`.
+
+**Xem trực tiếp worker đang làm gì.** Mỗi worker chạy với `--output-format stream-json`, nên pane autopilot in ra từng bước theo thời gian thực (💬 suy nghĩ, 🔧 công cụ và file đang dùng, ↳ cho subagent). Các dòng này cũng được ghi vào `run/live.log`. Muốn liếc nhanh mà không mở giao diện: `herdr pane read <pane-id> --source recent --lines 40`.
+
+**Tự chạy lại sau khi herdr server khởi động lại.** Autopilot đăng ký với herdr lệnh resume của chính nó. Sau khi herdr server restart, herdr mở lại pane và chạy lại `autopilot run …`; state.json giúp nó tiếp tục từ task đang dở, và phần thay đổi chưa commit của lần thử bị gián đoạn sẽ được bỏ đi. Lưu ý: herdr khôi phục layout và chạy lại lệnh, nhưng tiến trình cũ không sống sót qua restart, và nếu máy khởi động lại thì bạn cần mở lại herdr server (`herdr` hoặc `herdr server`).
+
+**Giữ pane mở ở cuối** để trạng thái done/blocked còn nguyên đến khi bạn xem. Dùng `--no-hold` nếu muốn script thoát luôn.
+
+**Không để hook của herdr làm nhiễu.** Nếu bạn đã cài `herdr integration install claude`, hook đó sẽ chạy trong mọi phiên Claude Code. Autopilot xoá các biến `HERDR_*` khỏi môi trường của worker, nên các phiên `claude -p` không ghi đè trạng thái pane.
+
+**Chạy trên máy khác.** Với máy dev hoặc server qua SSH, cài herdr và kit ở máy đó, mở bằng `herdr --remote <máy>`, rồi chạy `autopilot herdr …` ở đó. Từ laptop, xem trạng thái bằng `herdr --machine <tên> agent list`.
 
 ## Chọn model và effort
 
@@ -70,6 +101,7 @@ Model mạnh (lúc lập plan) gán `model` và `effort` cho từng task theo b�
 | `task.review` | `true` thì một phiên reviewer (mặc định Opus/high, chỉ đọc) phải approve diff. |
 | `task.escalate_to` | `{ "model": ..., "effort": ... }` dùng cho các lần thử từ lần 2. |
 | `task.context_files` | Gợi ý file liên quan để worker khỏi phải đi tìm, tiết kiệm context. |
+| `defaults.stream` | Mặc định `true`: dùng `stream-json` để có live view. Đặt `false` để quay về `--output-format json` nếu bản Claude Code của bạn có vấn đề với stream. |
 
 Ví dụ đầy đủ ở `examples/tasks.example.json`.
 
@@ -102,4 +134,4 @@ examples/tasks.example.json
 install.sh
 ```
 
-Trong repo đang làm, mỗi plan nằm ở `.autopilot/<plan-id>/`. Thư mục `run/` (state, log từng phiên dạng JSON, REPORT.md) được tự thêm vào `.git/info/exclude`. `PROGRESS.md` và `DECISIONS.md` nằm trong worktree và đi theo từng commit, để worker sau biết worker trước đã làm gì.
+Trong repo đang làm, mỗi plan nằm ở `.autopilot/<plan-id>/`. Thư mục `run/` (state, log từng phiên dạng JSONL, `live.log`, REPORT.md) được tự thêm vào `.git/info/exclude`. `PROGRESS.md` và `DECISIONS.md` nằm trong worktree và đi theo từng commit, để worker sau biết worker trước đã làm gì.
