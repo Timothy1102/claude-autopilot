@@ -46,10 +46,14 @@ PROMPTS_DIR = KIT_DIR / "prompts"
 
 MODEL_LADDER = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
 EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"]
+# Hard ceiling over every session (workers, fix-ups, reviewer). Anything above is clamped down.
+MODEL_RANK = ["haiku", "sonnet", "opus", "fable"]   # weakest -> strongest family
 
 DEFAULTS = {
     "model": "claude-sonnet-5-5",
     "effort": "medium",
+    "max_model": "claude-opus-5-5",  # highest model any session may use (clamps tasks, escalation, reviewer)
+    "max_effort": "xhigh",           # highest effort any session may use
     "max_attempts": 3,
     "max_budget_usd": 8.0,          # per worker session (passed to --max-budget-usd)
     "timeout_minutes": 90,          # per worker session
@@ -358,6 +362,26 @@ def topo_order(tasks):
     return order
 
 
+def _family(model):
+    for i, fam in enumerate(MODEL_RANK):
+        if fam in model:
+            return i
+    return None
+
+
+def clamp(model, effort, d):
+    """Enforce defaults.max_model / max_effort; unknown models are treated as over the cap."""
+    cap_m, cap_e = d.get("max_model"), d.get("max_effort")
+    if cap_m:
+        fm, fc = _family(model), _family(cap_m)
+        if fc is not None and (fm is None or fm > fc):
+            model = cap_m
+    if cap_e and effort in EFFORT_LADDER and cap_e in EFFORT_LADDER \
+            and EFFORT_LADDER.index(effort) > EFFORT_LADDER.index(cap_e):
+        effort = cap_e
+    return model, effort
+
+
 def pick_model(task, d, attempt):
     model = task.get("model", d["model"])
     effort = task.get("effort", d["effort"])
@@ -566,6 +590,7 @@ class Runner:
         resume_sid continues an existing session (fix-up rounds); prev_total is what that session had
         already reported as total_cost_usd, so only the new spend is counted. Raises LimitExhausted when
         the limit does not clear within max_limit_waits."""
+        model, effort = clamp(model, effort, self.d)
         waits, cost, text_in = 0, 0.0, prompt
         while True:
             stream = bool(self.d.get("stream", True))

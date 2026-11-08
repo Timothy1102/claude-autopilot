@@ -167,6 +167,7 @@ When `autopilot run` executes inside a herdr pane (`HERDR_ENV=1`), it automatica
 | `defaults.verify` | Command(s) run after every task (typecheck, lint, test). Non-zero exit = fail. |
 | `defaults.setup` | Run once when the worktree is created, e.g. copy `.env` and `npm ci`. |
 | `defaults.permission_mode` | Default `auto` (a classifier vets each action). See [Safety](#safety). |
+| `defaults.max_model` / `max_effort` | Hard ceiling for every session (workers, fix-ups, reviewer, escalation). Defaults: `claude-opus-5-5` / `xhigh`; anything higher is clamped down. |
 | `defaults.max_budget_usd` | Cost ceiling per worker session, passed as `--max-budget-usd`. |
 | `defaults.limit_wait_minutes` / `max_limit_waits` | On a usage limit, sleep then `--resume` the same session. If the message includes a reset time the script sleeps exactly that long; `limit_wait_minutes` is only the fallback. After `max_limit_waits` the run stops and the task stays pending. |
 | `defaults.fixups` / `fixup_budget_usd` / `fixup_timeout_minutes` | Fix-up rounds in the same worker session before reset and escalation (default 1, extra $4 and 30 min per round). `task.fixups` overrides per task; `0` disables. |
