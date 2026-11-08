@@ -35,7 +35,7 @@ You and a strong model settle every decision up front in a `SPEC.md` and a `task
 One install works for every repo:
 
 ```bash
-git clone https://github.com/<your-username>/claude-autopilot ~/.claude-autopilot
+git clone https://github.com/Timothy1102/claude-autopilot ~/.claude-autopilot
 ~/.claude-autopilot/install.sh
 ```
 
