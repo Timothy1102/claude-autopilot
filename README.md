@@ -1,148 +1,223 @@
 # claude-autopilot
 
-Bộ kit giúp Claude Code chạy một task lớn từ đầu đến cuối mà không cần người ngồi canh: bạn cùng một model mạnh chốt toàn bộ quyết định thành `SPEC.md` và `tasks.json`, sau đó một script chạy từng task bằng một phiên `claude -p` riêng (context sạch, model và effort riêng), tự kiểm tra, tự commit, tự thử lại và để lại báo cáo cho sáng hôm sau.
+Run a large task with [Claude Code](https://claude.com/claude-code) from start to finish, unattended — for example overnight.
 
-## Ý tưởng chính
+You and a strong model settle every decision up front in a `SPEC.md` and a `tasks.json`. After that, a Python script runs each task in its own fresh `claude -p` session (clean context, its own model and effort level), verifies the result, commits it, retries on failure, and leaves a report for the morning.
 
-Hệ thống này chạy tin cậy được qua đêm nhờ ba nguyên tắc.
+```
+ You + Opus (interactive)            autopilot (unattended)                 You (next morning)
+┌──────────────────────────┐      ┌──────────────────────────────┐      ┌─────────────────────┐
+│ /autopilot-plan          │      │ for each task:               │      │ read REPORT.md      │
+│  → SPEC.md               │ ───► │   worker session (claude -p) │ ───► │ review git diff     │
+│  → tasks.json            │      │   verify → review → commit   │      │ answer open questions│
+│  (20–60 min, you decide) │      │   fix-up / retry / escalate  │      │ merge or open a PR  │
+└──────────────────────────┘      └──────────────────────────────┘      └─────────────────────┘
+```
 
-**Điều phối nằm trong code, không nằm trong Claude.** Thứ tự task, số lần thử, việc nâng model và trạng thái được lưu trong `state.json` và do script Python quản lý. Vì vậy một phiên Claude có crash hay bị giới hạn usage thì cả đêm cũng không hỏng, và chạy lại đúng lệnh cũ sẽ tiếp tục từ chỗ dừng.
+## Why it works overnight
 
-**Không tin lời tự báo cáo.** Worker nói "xong" chưa đủ. Script tự chạy các lệnh `verify` (test, typecheck, lint). Với task quan trọng, một phiên Opus chỉ-đọc review diff. Chỉ khi cả hai đều qua thì script mới commit. Nếu fail, script trước hết đưa lỗi trở lại **chính phiên worker đó** (`--resume`, context và code dở đã có sẵn nên rẻ và nhanh) để sửa một vòng; chỉ khi vòng sửa đó vẫn fail thì worktree mới được reset về commit tốt gần nhất, lỗi được đưa vào prompt của lần thử sau, và model được nâng lên.
+**Orchestration lives in code, not in Claude.** Task order, retry counts, model escalation, and state are managed by the script and persisted in `state.json`. If a Claude session crashes or hits a usage limit, nothing is lost — re-run the same command and it resumes where it stopped.
 
-**Không ai hỏi ai.** Worker chạy với `--permission-prompts none`, nên không có công cụ để hỏi bạn. Gặp chỗ mơ hồ thì worker tự chọn theo spec và ghi vào `DECISIONS.md`. Chỉ khi thật sự không thể đi tiếp (spec mâu thuẫn, cần credential, thao tác không thể hoàn tác), worker trả về `blocked` kèm câu hỏi và đề xuất trả lời. Script ghi câu hỏi vào báo cáo, bỏ qua các task phụ thuộc vào nó và vẫn chạy tiếp các nhánh việc khác.
+**It doesn't trust self-reports.** A worker saying "done" isn't enough. The script runs your `verify` commands (tests, typecheck, lint) and, for important tasks, a read-only Opus reviewer inspects the diff. Only if both pass does the script commit. On failure, the error is first sent back to the *same worker session* (`--resume`, so context and half-finished code are still there — cheap and fast) for one fix-up round. Only if that also fails is the worktree reset to the last good commit, the error added to the next attempt's prompt, and the model escalated.
 
-## Cài đặt (một lần cho mọi repo)
+**Nobody asks anybody.** Workers run with `--permission-prompts none`, so they have no way to ask you questions. When something is ambiguous they pick the option that best fits the spec and log it in `DECISIONS.md`. Only when they truly can't continue (contradictory spec, missing credentials, irreversible action) do they return `blocked` with a question and a suggested answer. The script records it in the report, skips the tasks that depend on it, and keeps going with independent branches of work.
+
+## Requirements
+
+- [Claude Code](https://claude.com/claude-code) **v2.1.259 or newer** (needs the `--permission-prompts` flag)
+- Python 3.9+ (standard library only — no pip install)
+- git
+- macOS, Linux, or WSL
+- Optional but recommended for overnight runs: [herdr](https://herdr.dev) (terminal workspace manager — see [Running with herdr](#running-with-herdr))
+
+## Installation
+
+One install works for every repo:
 
 ```bash
-git clone <nơi bạn lưu kit này> ~/.claude-autopilot   # hoặc giải nén vào đó
+git clone https://github.com/<your-username>/claude-autopilot ~/.claude-autopilot
 ~/.claude-autopilot/install.sh
 ```
 
-Lệnh trên tạo lệnh `autopilot` trong `~/.local/bin` và cài skill `/autopilot-plan` vào `~/.claude/skills/`, nên dùng được ở mọi project. Yêu cầu: Claude Code v2.1.259 trở lên (cần cho flag `--permission-prompts`), Python 3.9+, git, và macOS, Linux hoặc WSL.
+This creates the `autopilot` command in `~/.local/bin` and installs the `/autopilot-plan` skill into `~/.claude/skills/`. Make sure `~/.local/bin` is on your `PATH`.
 
-Cài thêm [herdr](https://herdr.dev) để chạy qua đêm (khuyến nghị):
+Optional herdr setup:
 
 ```bash
-brew install herdr                     # hoặc: curl -fsSL https://herdr.dev/install.sh | sh
-herdr integration install claude       # để herdr hiện trạng thái phiên Claude lập plan
+brew install herdr                     # or: curl -fsSL https://herdr.dev/install.sh | sh
+herdr integration install claude       # shows the planning session's status in herdr
 ```
 
-Mặc định herdr không bật popup thông báo. Muốn sáng dậy thấy thông báo, thêm vào `~/.config/herdr/config.toml` rồi chạy `herdr server reload-config`:
+herdr doesn't show popup notifications by default. To get one when a run finishes, add this to `~/.config/herdr/config.toml` and run `herdr server reload-config`:
 
 ```toml
 [ui.toast]
-delivery = "system"   # hoặc "herdr" để hiện toast trong giao diện herdr
+delivery = "system"   # or "herdr" for in-app toasts
 ```
 
-## Quy trình mỗi task lớn
+## Usage
 
-**1. Lập plan (bạn có mặt, khoảng 20–60 phút).** Mở herdr ở repo, rồi mở phiên mạnh nhất trong một pane:
+### 1. Plan (you're present, ~20–60 minutes)
+
+Start your strongest model in the repo you want to change:
 
 ```bash
-cd ~/code/myrepo && herdr
+cd ~/code/myrepo
 claude --model claude-opus-5-5 --effort xhigh
-> /autopilot-plan Viết lại module billing theo hướng invoice-based, ...
+> /autopilot-plan Rewrite the billing module to be invoice-based, ...
 ```
 
-Skill sẽ đọc codebase, chạy thử test để chắc baseline đang xanh, rồi hỏi bạn từng nhóm quyết định (luôn kèm phương án đề xuất). Sau đó nó viết `.autopilot/<plan-id>/SPEC.md` và `tasks.json`, gán model và effort cho từng task, chạy `autopilot validate` và `--dry-run` cho bạn xem. Đây là bước duy nhất cần bạn. Thời gian bỏ ra ở đây quyết định chất lượng cả đêm.
+The skill reads the codebase, runs the tests to confirm the baseline is green, then asks you about each group of decisions (always with a recommended option). It then writes `.autopilot/<plan-id>/SPEC.md` and `tasks.json`, assigns a model and effort level to every task, and runs `autopilot validate` plus `--dry-run` so you can see the result.
 
-**2. Chạy (bạn đi ngủ).** Cuối phiên lập plan, skill sẽ đưa lệnh này (và hỏi có muốn nó chạy giúp không):
+This is the only step that needs you. The time you spend here determines the quality of the whole run.
+
+### 2. Run (you go to sleep)
+
+At the end of planning the skill prints the command to launch (and offers to run it for you):
 
 ```bash
 autopilot herdr .autopilot/billing-v2/tasks.json --max-total-usd 60
 ```
 
-Lệnh này tạo một workspace herdr tên `autopilot billing-v2`, chạy `autopilot run` trong đó rồi trả về ngay. Bạn có thể đóng terminal, gập laptop hay mất SSH: run vẫn sống trong herdr server. Nếu bạn đang ở trong một pane herdr, gõ thẳng `autopilot run …` ở pane đó cũng được.
+This creates a herdr workspace named `autopilot billing-v2`, starts `autopilot run` inside it, and returns immediately. You can close the terminal, shut the laptop, or lose your SSH connection — the run lives on in the herdr server. Without herdr, run it directly (ideally inside `tmux`/`screen`):
 
-Script tạo một git worktree riêng ở `../<repo>.autopilot-<plan-id>` trên branch `autopilot/<plan-id>`, nên checkout chính của bạn không bị đụng tới và bạn vẫn làm việc khác được. Mỗi task thành công là một commit.
+```bash
+autopilot run .autopilot/billing-v2/tasks.json --max-total-usd 60
+```
 
-**3. Sáng hôm sau.** Mở `herdr`. Sidebar cho biết ngay kết quả: workspace autopilot hiện **done** nếu mọi task xong, hoặc **blocked** nếu có task cần bạn. Pane autopilot vẫn mở, giữ nguyên log và đường dẫn tới báo cáo; nhấn Enter khi xem xong. Đọc `.autopilot/<plan-id>/run/REPORT.md`, có bảng trạng thái, chi phí, và mục "Needs you" liệt kê câu hỏi cùng lỗi cuối. Review bằng `git log` / `git diff main...autopilot/<plan-id>`. Nếu có câu hỏi, bổ sung quyết định vào `SPEC.md` (hoặc sửa `tasks.json`) trong checkout chính, rồi chạy:
+The script creates a dedicated git worktree at `../<repo>.autopilot-<plan-id>` on branch `autopilot/<plan-id>`, so your main checkout is untouched and you can keep working. Every successful task becomes one commit.
+
+### 3. Review (next morning)
+
+- Check the herdr sidebar: the workspace shows **done** if every task finished, or **blocked** if something needs you.
+- Read `.autopilot/<plan-id>/run/REPORT.md` — a status table, costs, and a "Needs you" section listing open questions and last errors.
+- Review the work with `git log` and `git diff main...autopilot/<plan-id>`.
+- If there are open questions, add the decisions to `SPEC.md` (or edit `tasks.json`) in your main checkout, then resume:
 
 ```bash
 autopilot run .autopilot/billing-v2/tasks.json --retry-failed
 ```
 
-Hài lòng thì merge hoặc mở PR từ branch đó.
+When you're happy, merge the branch or open a PR.
 
-## Chạy với herdr
+## Commands
 
-Khi `autopilot run` chạy trong một pane herdr (`HERDR_ENV=1`), nó tự làm thêm mấy việc sau, không cần cấu hình.
+```
+autopilot validate <tasks.json>     # check the plan file for errors
+autopilot run      <tasks.json>     # run the plan in this terminal
+autopilot herdr    <tasks.json>     # start the run in a new herdr workspace and return
+autopilot status   <tasks.json>     # show task states (add --sessions for per-session detail)
+```
 
-**Báo trạng thái lên sidebar.** Pane được báo là `working` kèm dòng mô tả như "T03 Invoice service · attempt 2 · sonnet-5-5/high", và tiêu đề pane hiện tiến độ kiểu "3/7 done · $4.20". Khi kết thúc, pane chuyển sang `done`, hoặc `blocked` nếu có task fail hay đang chờ câu hỏi; herdr phát âm thanh và thông báo tương ứng. Vì là trạng thái agent thật, bạn cũng có thể đợi nó từ script: `herdr agent wait <pane-id> --until idle --until blocked`.
+Options for `run` / `herdr`:
 
-**Xem trực tiếp worker đang làm gì.** Mỗi worker chạy với `--output-format stream-json`, nên pane autopilot in ra từng bước theo thời gian thực (💬 suy nghĩ, 🔧 công cụ và file đang dùng, ↳ cho subagent). Các dòng này cũng được ghi vào `run/live.log`. Muốn liếc nhanh mà không mở giao diện: `herdr pane read <pane-id> --source recent --lines 40`.
-
-**Tự chạy lại sau khi herdr server khởi động lại.** Autopilot đăng ký với herdr lệnh resume của chính nó. Sau khi herdr server restart, herdr mở lại pane và chạy lại `autopilot run …`; state.json giúp nó tiếp tục từ task đang dở, và phần thay đổi chưa commit của lần thử bị gián đoạn sẽ được bỏ đi. Lưu ý: herdr khôi phục layout và chạy lại lệnh, nhưng tiến trình cũ không sống sót qua restart, và nếu máy khởi động lại thì bạn cần mở lại herdr server (`herdr` hoặc `herdr server`).
-
-**Giữ pane mở ở cuối** để trạng thái done/blocked còn nguyên đến khi bạn xem. Dùng `--no-hold` nếu muốn script thoát luôn.
-
-**Không để hook của herdr làm nhiễu.** Nếu bạn đã cài `herdr integration install claude`, hook đó sẽ chạy trong mọi phiên Claude Code. Autopilot xoá các biến `HERDR_*` khỏi môi trường của worker, nên các phiên `claude -p` không ghi đè trạng thái pane.
-
-**Chạy trên máy khác.** Với máy dev hoặc server qua SSH, cài herdr và kit ở máy đó, mở bằng `herdr --remote <máy>`, rồi chạy `autopilot herdr …` ở đó. Từ laptop, xem trạng thái bằng `herdr --machine <tên> agent list`.
-
-## Chọn model và effort
-
-Model mạnh (lúc lập plan) gán `model` và `effort` cho từng task theo bảng trong skill: Haiku cho việc cơ học đã được đặc tả đầy đủ, Sonnet/medium cho feature thông thường, Sonnet/high cho logic khó nhiều file, Opus/high cho kiến trúc, migration, concurrency, bảo mật, bước tích hợp và review cuối. Nguyên tắc là chọn mức rẻ nhất có khả năng thành công, vì khi thất bại script tự leo thang theo hai bậc. Bậc một là **vòng sửa (fix-up)**: lỗi verify, ý kiến của reviewer hay lỗi commit hook được gửi lại cho đúng phiên worker vừa làm, với cùng model và thêm một khoản ngân sách nhỏ (`fixup_budget_usd`); phiên đó đã có context và code dở nên thường sửa xong trong vài phút. Bậc hai, chỉ khi vòng sửa vẫn fail: reset worktree và chạy lần thử mới với model kế tiếp (Haiku → Sonnet → Opus, effort tối thiểu `high`); khi đã ở Opus thì tăng effort. Muốn kiểm soát riêng cho một task thì đặt `escalate_to`, hoặc `fixups: 0` để bỏ bậc một.
-
-Để kiểm tra trước, `autopilot run ... --dry-run` in ra model và effort của lần đầu và lần retry cho từng task.
-
-### Những gì script làm để tiết kiệm thời gian và chi phí
-
-- **Vòng sửa trước khi leo thang** (ở trên). Một task Sonnet gần xong mà fail một test không còn bị vứt đi để chạy lại từ đầu bằng Opus.
-- **Spec được dán thẳng vào prompt.** Nếu `SPEC.md` không quá `inline_spec_kb` (mặc định 48 KB), worker nhận SPEC, đuôi của PROGRESS.md và DECISIONS.md ngay trong task message, bớt ba lượt gọi tool đọc file ở đầu mỗi task.
-- **Reviewer không nuốt cả diff.** Diff dán vào prompt reviewer bị cắt ở `review_inline_diff_kb` (mặc định 120 KB); phần còn lại reviewer tự lấy bằng `git diff` cho từng file theo diff stat, thay vì đổ hàng trăm KB vào Opus.
-- **Chờ giới hạn usage đúng bằng thời gian cần chờ.** Nếu thông báo giới hạn có ghi thời điểm reset ("resets at 3am", "try again in 25 minutes") thì script ngủ đúng chừng đó (cộng một phút, tối đa 6 giờ) thay vì cố định `limit_wait_minutes`. Hết `max_limit_waits` mà vẫn bị giới hạn thì run dừng và giữ task ở trạng thái pending, không đốt một lần thử rồi leo lên Opus vì lý do không phải lỗi code.
-- Báo cáo và `autopilot status --sessions` có thêm cột thời gian và số vòng sửa của từng task, để bạn thấy task nào ngốn thời gian và điều chỉnh model cho lần plan sau.
-
-## Các trường trong tasks.json
-
-| Trường | Ý nghĩa |
+| Option | Meaning |
 |---|---|
-| `defaults.verify` | Lệnh chạy sau mọi task (typecheck, lint, test). Exit khác 0 nghĩa là fail. |
-| `defaults.setup` | Chạy một lần khi tạo worktree, ví dụ copy `.env` và `npm ci`. |
-| `defaults.permission_mode` | Mặc định `auto` (classifier duyệt từng hành động). Xem phần an toàn bên dưới. |
-| `defaults.max_budget_usd` | Trần chi phí mỗi phiên worker, truyền vào `--max-budget-usd`. |
-| `defaults.limit_wait_minutes` / `max_limit_waits` | Gặp giới hạn usage thì ngủ rồi `--resume` đúng phiên đó. Nếu thông báo có ghi giờ reset thì ngủ đúng chừng đó; `limit_wait_minutes` chỉ là mức dự phòng. Hết `max_limit_waits` thì run dừng, task giữ pending. |
-| `defaults.fixups` / `fixup_budget_usd` / `fixup_timeout_minutes` | Số vòng sửa trong cùng phiên worker trước khi reset và leo thang (mặc định 1, thêm $4 và 30 phút mỗi vòng). `task.fixups` ghi đè cho từng task; `0` để tắt. |
-| `defaults.inline_spec_kb` | Dán SPEC.md (và đuôi PROGRESS/DECISIONS) vào prompt khi SPEC không quá kích thước này (mặc định 48). `0` để worker luôn tự đọc file. |
-| `defaults.review_inline_diff_kb` | Cắt diff dán cho reviewer ở kích thước này (mặc định 120); reviewer dùng `git diff` cho phần còn lại. |
-| `task.depends_on` | Task phụ thuộc. Phụ thuộc fail hoặc blocked thì task này bị skip, các nhánh khác vẫn chạy. |
-| `task.verify` | Lệnh kiểm tra riêng của task, chạy thêm vào `defaults.verify`. |
-| `task.review` | `true` thì một phiên reviewer (mặc định Opus/high, chỉ đọc) phải approve diff. |
-| `task.escalate_to` | `{ "model": ..., "effort": ... }` dùng cho các lần thử từ lần 2. |
-| `task.context_files` | Gợi ý file liên quan để worker khỏi phải đi tìm, tiết kiệm context. |
-| `defaults.stream` | Mặc định `true`: dùng `stream-json` để có live view. Đặt `false` để quay về `--output-format json` nếu bản Claude Code của bạn có vấn đề với stream. |
+| `--dry-run` | Print the model/effort for each task's first attempt and retry, without running anything |
+| `--retry-failed` | Reset failed / blocked / skipped tasks to pending |
+| `--only T03,T04` | Run only the listed task ids |
+| `--max-total-usd N` | Stop the whole run once estimated total cost exceeds N |
+| `--notify-cmd "..."` | Shell command that receives a one-line summary on stdin when the run ends |
+| `--force-clean` | Discard uncommitted changes in the worktree |
+| `--no-hold` | Inside herdr, exit when done instead of waiting for Enter |
+| `--claude-bin PATH` | Use a specific `claude` binary |
 
-Ví dụ đầy đủ ở `examples/tasks.example.json`.
+## Model and effort selection
 
-## An toàn
+During planning, the strong model assigns a `model` and `effort` to each task:
 
-Worker bị cấm `git push`, `commit`, `reset`, `rebase`, `merge`, đổi branch. Chỉ script mới commit, và chỉ trong worktree riêng. Mặc định dùng `auto` permission mode, nghĩa là một classifier xem xét từng lệnh thay cho bạn và chặn những gì rủi ro. Nếu muốn dùng `bypassPermissions` để không bao giờ bị từ chối, chỉ nên làm vậy trong devcontainer, Docker hay VM không có credential production. Đừng dùng nó trên máy chính. Nên thêm deny rule trong `~/.claude/settings.json` cho những thứ bạn không bao giờ muốn chạy tự động (deploy, lệnh database production, v.v.).
+| Kind of work | Suggested setting |
+|---|---|
+| Mechanical, fully specified changes | Haiku |
+| Ordinary features | Sonnet / medium |
+| Hard multi-file logic | Sonnet / high |
+| Architecture, migrations, concurrency, security, integration, final review | Opus / high |
 
-`--max-total-usd` dừng cả run khi tổng chi phí ước tính vượt ngưỡng. Con số chi phí là ước tính phía client nên có thể lệch hóa đơn thật. Nếu dùng gói subscription, tác vụ cả đêm sẽ ăn vào giới hạn phiên và giới hạn tuần của bạn; script sẽ ngủ chờ reset rồi chạy tiếp, nhưng giới hạn tuần thì có thể không reset trong đêm.
+The rule is to pick the cheapest setting likely to succeed, because failures escalate automatically in two steps:
 
-## Giới hạn và khi nào dùng tính năng có sẵn
+1. **Fix-up round.** Verify errors, reviewer feedback, or commit-hook failures are sent back to the same worker session, same model, with a small extra budget (`fixup_budget_usd`). That session already has the context and the half-done code, so it usually fixes things in minutes.
+2. **Escalation.** Only if the fix-up fails: reset the worktree and retry with the next model (Haiku → Sonnet → Opus, effort at least `high`); if already on Opus, raise the effort.
 
-Kit chạy các task **tuần tự**. Đây là lựa chọn có chủ ý: mỗi task được xây trên commit đã được kiểm chứng của task trước, không có xung đột merge, và qua một đêm thì thông lượng tuần tự thường đã đủ. Bên trong một task, worker vẫn tự dùng subagent để song song hóa việc tìm kiếm.
+Override per task with `escalate_to`, or set `fixups: 0` to skip step 1.
 
-Claude Code cũng có sẵn vài cách điều phối nhiều agent, phù hợp cho những trường hợp khác:
+### Built-in time and cost savers
 
-- **Dynamic workflows** (`/workflows`, từ khóa `ultracode`) hợp với việc fan-out nhiều agent giống nhau, như audit hàng trăm file hay migrate từng file độc lập, ngay trong một phiên tương tác.
-- **Projects** trên claude.ai/code hợp khi bạn muốn việc chạy trên cloud ngay cả khi tắt máy.
-- **Agent teams** (thử nghiệm, tắt mặc định) hợp khi muốn một lead điều phối các phiên nói chuyện với nhau.
+- **Fix-up before escalation** — a Sonnet task that fails a single test isn't thrown away and redone on Opus.
+- **Spec inlined in the prompt** — if `SPEC.md` is under `inline_spec_kb` (default 48 KB), the worker gets it, plus the tail of `PROGRESS.md` and `DECISIONS.md`, directly in the task message, saving several file-read tool calls per task.
+- **Bounded review diffs** — the diff pasted to the reviewer is truncated at `review_inline_diff_kb` (default 120 KB); the reviewer fetches the rest per file with `git diff`.
+- **Precise limit waits** — if a usage-limit message includes a reset time ("resets at 3am", "try again in 25 minutes"), the script sleeps for exactly that long (+1 minute, max 6 hours) instead of a fixed delay. After `max_limit_waits` it stops the run and leaves the task pending rather than burning an attempt and escalating to Opus for a non-code reason.
+- **Per-task timing** — the report and `autopilot status --sessions` show duration and fix-up rounds per task, so you can tune models in the next plan.
 
-Kit này phù hợp nhất cho một chuỗi task có thứ tự, chạy trên máy hoặc server của bạn, có cổng kiểm chứng giữa các bước.
+## Running with herdr
 
-## Cấu trúc file
+When `autopilot run` executes inside a herdr pane (`HERDR_ENV=1`), it automatically does the following — no configuration needed:
+
+- **Sidebar status.** The pane is `working` with a description like "T03 Invoice service · attempt 2 · sonnet-5-5/high", and the pane title shows progress ("3/7 done · $4.20"). At the end it switches to `done`, or `blocked` if any task failed or has an open question; herdr plays the matching sound and notification. You can also wait on it from a script: `herdr agent wait <pane-id> --until idle --until blocked`.
+- **Live view.** Each worker runs with `--output-format stream-json`, so the pane prints every step as it happens (💬 thinking, 🔧 tool and file, ↳ subagents). The same lines are written to `run/live.log`. For a quick peek without opening the UI: `herdr pane read <pane-id> --source recent --lines 40`.
+- **Auto-resume.** Autopilot registers its own resume command with herdr. After a herdr server restart, herdr reopens the pane and re-runs `autopilot run …`; `state.json` lets it continue from the interrupted task, and uncommitted changes from the interrupted attempt are discarded. Note that old processes don't survive a restart, and if the machine itself reboots you need to start herdr (`herdr` or `herdr server`) again.
+- **Pane stays open** at the end so the done/blocked state is still visible when you return. Use `--no-hold` to exit immediately.
+- **No hook interference.** If you've run `herdr integration install claude`, that hook fires in every Claude Code session. Autopilot strips `HERDR_*` variables from the worker environment so `claude -p` sessions don't overwrite the pane state.
+
+**Remote machines.** For a dev box or server over SSH, install herdr and this kit there, connect with `herdr --remote <machine>`, and run `autopilot herdr …` on it. From your laptop, check status with `herdr --machine <name> agent list`.
+
+## tasks.json reference
+
+| Field | Meaning |
+|---|---|
+| `defaults.verify` | Command(s) run after every task (typecheck, lint, test). Non-zero exit = fail. |
+| `defaults.setup` | Run once when the worktree is created, e.g. copy `.env` and `npm ci`. |
+| `defaults.permission_mode` | Default `auto` (a classifier vets each action). See [Safety](#safety). |
+| `defaults.max_budget_usd` | Cost ceiling per worker session, passed as `--max-budget-usd`. |
+| `defaults.limit_wait_minutes` / `max_limit_waits` | On a usage limit, sleep then `--resume` the same session. If the message includes a reset time the script sleeps exactly that long; `limit_wait_minutes` is only the fallback. After `max_limit_waits` the run stops and the task stays pending. |
+| `defaults.fixups` / `fixup_budget_usd` / `fixup_timeout_minutes` | Fix-up rounds in the same worker session before reset and escalation (default 1, extra $4 and 30 min per round). `task.fixups` overrides per task; `0` disables. |
+| `defaults.inline_spec_kb` | Inline `SPEC.md` (and the tail of PROGRESS/DECISIONS) in the prompt when the spec is at most this size (default 48). `0` makes the worker always read files itself. |
+| `defaults.review_inline_diff_kb` | Truncate the diff pasted to the reviewer at this size (default 120); the reviewer uses `git diff` for the rest. |
+| `defaults.stream` | Default `true`: use `stream-json` for the live view. Set `false` to fall back to `--output-format json` if your Claude Code version has stream issues. |
+| `task.depends_on` | Task ids this task depends on. If a dependency fails or is blocked, this task is skipped; other branches continue. |
+| `task.verify` | Task-specific checks, run in addition to `defaults.verify`. |
+| `task.review` | If `true`, a read-only reviewer session (default Opus/high) must approve the diff. |
+| `task.escalate_to` | `{ "model": ..., "effort": ... }` used from the second attempt on. |
+| `task.context_files` | Files the worker should look at first, saving exploration context. |
+
+A complete example is in [`examples/tasks.example.json`](examples/tasks.example.json).
+
+## Safety
+
+- Workers are forbidden from `git push`, `commit`, `reset`, `rebase`, `merge`, and switching branches. Only the script commits, and only inside its own worktree.
+- The default `auto` permission mode has a classifier vet each command on your behalf and block risky ones. If you'd rather use `bypassPermissions` so nothing is ever refused, do so **only** in a devcontainer, Docker, or VM with no production credentials — never on your main machine.
+- Add deny rules in `~/.claude/settings.json` for anything you never want run unattended (deploys, production database commands, etc.).
+- `--max-total-usd` stops the run when estimated total cost passes the threshold. The figure is a client-side estimate and may differ from your actual bill.
+- On a subscription plan, an overnight run consumes your session and weekly limits. The script sleeps until the limit resets and continues, but a weekly limit may not reset overnight.
+
+## Limitations and alternatives
+
+Tasks run **sequentially**, by design: each task builds on the previous verified commit, there are no merge conflicts, and for an overnight run sequential throughput is usually enough. Inside a task, the worker still uses subagents to parallelize searching.
+
+Claude Code has other multi-agent options that fit different situations:
+
+- **Dynamic workflows** (`/workflows`, the `ultracode` keyword) — fan-out of many identical agents, such as auditing hundreds of files or migrating independent files, within an interactive session.
+- **Projects** on claude.ai/code — when you want the work to run in the cloud even with your machine off.
+- **Agent teams** (experimental, off by default) — when you want a lead coordinating sessions that talk to each other.
+
+autopilot fits best for an ordered chain of tasks on your own machine or server, with verification gates between steps.
+
+## Repository layout
 
 ```
-autopilot.py                 # orchestrator (chỉ dùng thư viện chuẩn)
-prompts/worker.md            # luật cho worker, nạp qua --append-system-prompt-file
-prompts/reviewer.md          # luật cho reviewer
-skills/autopilot-plan/       # skill /autopilot-plan cho phiên lập plan
-examples/tasks.example.json
-install.sh
+autopilot.py                 # the orchestrator (standard library only)
+prompts/worker.md            # rules for workers, loaded via --append-system-prompt-file
+prompts/reviewer.md          # rules for the reviewer
+skills/autopilot-plan/       # the /autopilot-plan skill used in the planning session
+examples/tasks.example.json  # sample plan file
+install.sh                   # installs the command and the skill
 ```
 
-Trong repo đang làm, mỗi plan nằm ở `.autopilot/<plan-id>/`. Thư mục `run/` (state, log từng phiên dạng JSONL, `live.log`, REPORT.md) được tự thêm vào `.git/info/exclude`. `PROGRESS.md` và `DECISIONS.md` nằm trong worktree và đi theo từng commit, để worker sau biết worker trước đã làm gì.
+In the repo you're working on, each plan lives in `.autopilot/<plan-id>/`. The `run/` directory (state, per-session JSONL logs, `live.log`, `REPORT.md`) is added to `.git/info/exclude` automatically. `PROGRESS.md` and `DECISIONS.md` live in the worktree and travel with each commit so later workers know what earlier ones did.
+
+## Versioning
+
+[SemVer](https://semver.org); see [CHANGELOG.md](CHANGELOG.md). Check your version with `autopilot --version`.
+
+## License
+
+[MIT](LICENSE)
