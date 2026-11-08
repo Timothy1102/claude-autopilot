@@ -104,6 +104,11 @@ def ts() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def fmt_dur(seconds: float) -> str:
+    m = int(round(seconds / 60))
+    return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
 def tail(text: str, n: int = 6000) -> str:
     text = text or ""
     return text if len(text) <= n else "…(truncated)…\n" + text[-n:]
@@ -349,13 +354,17 @@ class Runner:
         self.claude = args.claude_bin
         self.herdr = Herdr(disabled=args.dry_run)
         self.current = ""               # short description of what is running, for herdr
+        self._elapsed_base = self.state["elapsed_seconds"]   # time from earlier invocations
+        self._run_t0 = time.time()
 
     # ---- state
     def _load_state(self):
-        st = {"plan_id": None, "total_cost_usd": 0.0, "tasks": {}}
+        st = {"plan_id": None, "total_cost_usd": 0.0, "elapsed_seconds": 0.0, "tasks": {}}
         if self.state_path.exists():
             st = json.loads(self.state_path.read_text(encoding="utf-8"))
         st["plan_id"] = self.plan["plan_id"]
+        st.setdefault("elapsed_seconds", 0.0)
+        st.setdefault("first_started_at", ts())
         for t in self.plan["tasks"]:
             s = st["tasks"].setdefault(t["id"], {"status": "pending", "attempts": 0, "cost_usd": 0.0, "history": []})
             if s["status"] == "running":
@@ -368,6 +377,9 @@ class Runner:
 
     def save(self):
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        # Active run time, summed over invocations (downtime between resumes is not counted).
+        self.state["elapsed_seconds"] = round(self._elapsed_base + time.time() - self._run_t0, 1)
+        self.state["updated_at"] = ts()
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.state_path)
@@ -630,6 +642,7 @@ class Runner:
             st["cost_usd"] += cost
             self.state["total_cost_usd"] += cost
             entry = {"attempt": attempt, "model": model, "effort": effort, "cost_usd": round(cost, 4),
+                     "started_at": dt.datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M:%S"),
                      "minutes": round((time.time() - started) / 60, 1),
                      "session_id": (data or {}).get("session_id")}
             st["history"].append(entry)
@@ -835,7 +848,9 @@ class Runner:
     def write_report(self):
         lines = [f"# Autopilot report — {self.pid}", "",
                  f"- Updated: {ts()}", f"- Branch: `{self.branch}`", f"- Worktree: `{self.wt}`",
-                 f"- Estimated cost so far: ${self.state['total_cost_usd']:.2f}", "",
+                 f"- Estimated cost so far: ${self.state['total_cost_usd']:.2f}",
+                 f"- Run time so far: {fmt_dur(self.state['elapsed_seconds'])} "
+                 f"(started {self.state.get('first_started_at', '-')})", "",
                  "| Task | Status | Attempts | Last model / effort | Cost | Note |",
                  "|---|---|---|---|---|---|"]
         for t in self.plan["tasks"]:
@@ -937,6 +952,7 @@ def main():
     add_run_options(sub.add_parser("herdr", help="start the run in a new herdr workspace and return"))
     s = sub.add_parser("status")
     s.add_argument("tasks")
+    s.add_argument("--sessions", action="store_true", help="list every session (attempt) with time, cost and session id")
     args = ap.parse_args()
 
     tasks_path = Path(args.tasks).resolve()
@@ -954,9 +970,19 @@ def main():
             print("not started")
             return
         st = json.loads(state_path.read_text(encoding="utf-8"))
+        if args.sessions:
+            print(f"{'TASK':<7}{'#':<3}{'MODEL':<20}{'EFFORT':<8}{'STARTED':<20}{'TIME':>7} {'COST':>8}  {'OUTCOME':<16}SESSION")
+            for tid, s in st["tasks"].items():
+                for h in s["history"]:
+                    print(f"{tid:<7}{h['attempt']:<3}{h['model']:<20}{h['effort']:<8}{h.get('started_at', '-'):<20}"
+                          f"{fmt_dur(h['minutes'] * 60):>7} ${h['cost_usd']:>7.2f}  {h.get('outcome', 'running'):<16}"
+                          f"{h.get('session_id') or '-'}")
+            print()
         for tid, s in st["tasks"].items():
-            print(f"{tid:<8} {s['status']:<8} attempts={s['attempts']} ${s['cost_usd']:.2f}")
-        print(f"total ${st['total_cost_usd']:.2f}")
+            t = sum(h["minutes"] for h in s["history"])
+            print(f"{tid:<8} {s['status']:<8} attempts={s['attempts']} time={fmt_dur(t * 60)} ${s['cost_usd']:.2f}")
+        print(f"total ${st['total_cost_usd']:.2f}, run time {fmt_dur(st.get('elapsed_seconds', 0))}"
+              f" (started {st.get('first_started_at', '-')})")
         return
     if args.cmd == "herdr":
         launch_in_herdr(args, tasks_path)
