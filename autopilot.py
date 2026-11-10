@@ -757,7 +757,7 @@ class Runner:
             for dcs in so.get("decisions", []):
                 f.write(f"- Decision: {dcs}\n")
         git(self.wt, "add", "-A")
-        c = run(["git", "commit", "-m", f"autopilot({tid}): {task['title']}", "-m", summary[:3000]],
+        c = run(["git", "commit", "-m", f"autopilot({self.pid} {tid}): {task['title']}", "-m", summary[:3000]],
                 self.wt, check=False)
         if c.returncode != 0:
             return False, "The git pre-commit hook rejected the change:\n" + tail(c.stdout + c.stderr, 3000)
@@ -776,7 +776,7 @@ class Runner:
             model, effort = pick_model(task, self.d, attempt)
             self.reset_clean()
             start_head = git(self.wt, "rev-parse", "HEAD")
-            self.log(f"{tid} attempt {attempt}: {model} / {effort}")
+            self.log(f"{tid} {task['title']} · attempt {attempt}: {model} / {effort}")
             self.current = f"{tid} a{attempt}"
             label = f"{tid} {task['title']} · attempt {attempt} · {model.replace('claude-', '')}/{effort}"
             self.herdr_progress(label)

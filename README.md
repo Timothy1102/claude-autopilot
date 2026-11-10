@@ -85,7 +85,7 @@ This creates a herdr workspace named `autopilot billing-v2`, starts `autopilot r
 autopilot run .autopilot/billing-v2/tasks.json --max-total-usd 60
 ```
 
-The script creates a dedicated git worktree at `../<repo>.autopilot-<plan-id>` on branch `autopilot/<plan-id>`, so your main checkout is untouched and you can keep working. Every successful task becomes one commit.
+The script creates a dedicated git worktree at `../<repo>.autopilot-<plan-id>` on branch `autopilot/<plan-id>`, so your main checkout is untouched and you can keep working. Every successful task becomes one commit, titled `autopilot(<plan-id> <task-id>): <task title>`.
 
 ### 3. Review (next morning)
 
