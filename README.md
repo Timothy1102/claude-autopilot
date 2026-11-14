@@ -120,7 +120,7 @@ Options for `run` / `herdr`:
 | `--notify-cmd "..."` | Shell command that receives a one-line summary on stdin when the run ends |
 | `--force-clean` | Discard uncommitted changes in the worktree |
 | `--no-hold` | Inside herdr, exit when done instead of waiting for Enter |
-| `--claude-bin PATH` | Use a specific `claude` binary |
+| `--claude-bin CMD` (alias `--claude`) | `claude` command for the workers. Default `claude` (or `$AUTOPILOT_CLAUDE`). Accepts a binary path, a shell alias such as `claude-personal` (resolved via your interactive shell), or `"CLAUDE_CONFIG_DIR=~/.claude-x claude"` |
 
 ## Model and effort selection
 

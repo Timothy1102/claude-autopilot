@@ -176,6 +176,59 @@ class Logger:
                 f.write(line + "\n")
 
 
+def _split_env_prefix(tokens):
+    """Split leading VAR=value tokens off a command: (['A=1','B=2','claude'] -> ({'A':'1','B':'2'}, ['claude']))."""
+    env = {}
+    while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+        k, v = tokens[0].split("=", 1)
+        env[k] = os.path.expandvars(os.path.expanduser(v))
+        tokens = tokens[1:]
+    return env, tokens
+
+
+def _shell_alias(name: str):
+    """Expansion of the shell alias `name` as defined in the user's interactive shell, or None."""
+    shell = os.environ.get("SHELL") or "/bin/zsh"
+    try:
+        out = subprocess.run([shell, "-ic", f"alias -- {shlex.quote(name)}"], capture_output=True,
+                             text=True, timeout=20, stdin=subprocess.DEVNULL).stdout
+    except Exception:  # noqa: BLE001
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("alias "):          # bash: alias name='...'
+            line = line[len("alias "):]
+        if line.startswith(name + "="):
+            try:
+                return shlex.split(line[len(name) + 1:])[0]
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
+def resolve_claude(spec: str, _depth: int = 0):
+    """Turn --claude-bin into (argv_prefix, extra_env).
+
+    Accepts a binary name/path, a command with env assignments
+    ("CLAUDE_CONFIG_DIR=~/.claude-work claude"), or the name of a shell alias such as
+    `claude-work` (looked up in your interactive shell, since aliases are invisible to subprocesses).
+    """
+    env, argv = _split_env_prefix(shlex.split(spec))
+    if not argv:
+        raise SystemExit(f"invalid --claude-bin {spec!r}")
+    exe = os.path.expanduser(argv[0])
+    if shutil.which(exe) or Path(exe).exists():
+        return [exe] + argv[1:], env
+    if _depth < 3 and len(argv) == 1:
+        expansion = _shell_alias(argv[0])
+        if expansion:
+            inner_argv, inner_env = resolve_claude(expansion, _depth + 1)
+            return inner_argv, {**inner_env, **env}
+    raise SystemExit(f"'{argv[0]}' is not a program on PATH or a shell alias "
+                     f"(shell functions are not supported; use a command like "
+                     f"\"CLAUDE_CONFIG_DIR=~/.claude-x claude\")")
+
+
 def child_env() -> dict:
     """Environment for workers, verify and setup commands.
 
@@ -186,11 +239,11 @@ def child_env() -> dict:
     return {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
 
 
-def run(cmd, cwd, check=True, timeout=None, input_text=None, shell=False):
+def run(cmd, cwd, check=True, timeout=None, input_text=None, shell=False, extra_env=None):
     p = subprocess.run(
         cmd, cwd=str(cwd), input=input_text, capture_output=True, text=True,
         timeout=timeout, shell=shell, executable="/bin/bash" if shell else None,
-        env=child_env(),
+        env={**child_env(), **(extra_env or {})},
     )
     if check and p.returncode != 0:
         raise RuntimeError(f"command failed ({p.returncode}): {cmd}\n{p.stdout}\n{p.stderr}")
@@ -420,7 +473,7 @@ class Runner:
         self.state_path = self.run_dir / "state.json"
         self.crashed = False            # set by _load_state when a task was mid-run last time
         self.state = self._load_state()
-        self.claude = args.claude_bin
+        self.claude, self.claude_env = ([args.claude_bin], {}) if args.dry_run else resolve_claude(args.claude_bin)
         self.herdr = Herdr(disabled=args.dry_run)
         self.current = ""               # short description of what is running, for herdr
         self._elapsed_base = self.state["elapsed_seconds"]   # time from earlier invocations
@@ -546,7 +599,8 @@ class Runner:
         err_path = out_path.with_suffix(".stderr.txt")
         with open(err_path, "w", encoding="utf-8") as err_f, open(out_path, "w", encoding="utf-8") as out_f:
             proc = subprocess.Popen(cmd, cwd=str(self.wt), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=err_f, text=True, env=child_env(), start_new_session=True)
+                                    stderr=err_f, text=True, env={**child_env(), **self.claude_env},
+                                    start_new_session=True)
             timed_out = threading.Event()
 
             def kill():
@@ -601,7 +655,7 @@ class Runner:
         while True:
             stream = bool(self.d.get("stream", True))
             cmd = [
-                self.claude, "-p",
+                *self.claude, "-p",
                 "--model", model, "--effort", effort,
                 "--permission-mode", permission_mode or self.d["permission_mode"],
                 "--permission-prompts", "none",
@@ -900,9 +954,9 @@ class Runner:
                 deps = ",".join(t.get("depends_on", [])) or "-"
                 print(f"  {t['id']:<6} {m}/{e:<7} (retry: {m2}/{e2})  deps={deps}  {t['title']}")
             return
-        version = run([self.claude, "--version"], self.repo, check=False)
+        version = run([*self.claude, "--version"], self.repo, check=False, extra_env=self.claude_env)
         if version.returncode != 0:
-            raise SystemExit(f"cannot run '{self.claude} --version'")
+            raise SystemExit(f"cannot run '{' '.join(self.claude)} --version'")
         self.log(f"claude {version.stdout.strip()} — starting plan {self.pid}")
         if self.herdr.enabled:
             self.log(f"herdr detected (pane {self.herdr.pane}): reporting state to the sidebar")
@@ -1068,7 +1122,9 @@ def add_run_options(p):
     p.add_argument("--notify-cmd", help="shell command; receives a one-line summary on stdin when the run ends")
     p.add_argument("--force-clean", action="store_true", help="discard uncommitted changes in the worktree")
     p.add_argument("--no-hold", action="store_true", help="inside herdr: exit when done instead of waiting for Enter")
-    p.add_argument("--claude-bin", default="claude")
+    p.add_argument("--claude-bin", "--claude", default=os.environ.get("AUTOPILOT_CLAUDE", "claude"),
+                   help="claude command to run workers with: a binary, a shell alias such as claude-work, "
+                        "or 'VAR=val claude' (default: $AUTOPILOT_CLAUDE or claude)")
 
 
 def passthrough(args):
@@ -1094,6 +1150,8 @@ def launch_in_herdr(args, tasks_path: Path):
     plan, _, errors, _ = load_plan(tasks_path)
     if errors:
         raise SystemExit("Plan is invalid:\n  " + "\n  ".join(errors))
+    if not args.dry_run:
+        resolve_claude(args.claude_bin)   # fail now, not inside the pane
     repo = Path(git(tasks_path.parent, "rev-parse", "--show-toplevel"))
     me = ["autopilot"] if shutil.which("autopilot") else [sys.executable, str(Path(__file__).resolve())]
     cmd = shlex.join(me + ["run", str(tasks_path)] + passthrough(args))
@@ -1167,8 +1225,6 @@ def main():
         launch_in_herdr(args, tasks_path)
         return
     if args.cmd == "run":
-        if not args.dry_run and not shutil.which(args.claude_bin) and not Path(args.claude_bin).exists():
-            raise SystemExit(f"'{args.claude_bin}' not found on PATH")
         Runner(tasks_path, args).run_all()
 
 
