@@ -511,7 +511,7 @@ class Runner:
             p = self.wt_plan / name
             if not p.exists():
                 p.write_text(header, encoding="utf-8")
-        git(self.wt, "add", "-A", str(self.rel))
+        self.stage()
         if run(["git", "diff", "--cached", "--quiet"], self.wt, check=False).returncode != 0:
             git(self.wt, "commit", "-m", f"autopilot({self.pid}): sync plan")
 
@@ -529,6 +529,12 @@ class Runner:
                     raise SystemExit(f"setup command failed: {cmd}\n{tail(p.stdout + p.stderr)}\n"
                                      "Fix the setup command and rerun; setup will be retried.")
             marker.unlink()
+
+    def stage(self):
+        """Stage everything in the worktree. The plan directory is force-added so it is tracked even
+        when the project's .gitignore ignores it (e.g. `.autopilot`); run/ stays out."""
+        git(self.wt, "add", "-A")
+        git(self.wt, "add", "-A", "-f", "--", str(self.rel), f":(exclude){self.rel.as_posix()}/run")
 
     def reset_clean(self):
         git(self.wt, "reset", "--hard", "-q", "HEAD")
@@ -663,7 +669,7 @@ class Runner:
         return True, ""
 
     def review(self, task, start_head):
-        git(self.wt, "add", "-A")
+        self.stage()
         stat = git(self.wt, "diff", "--cached", "--stat", start_head)
         diff = git(self.wt, "diff", "--cached", start_head)
         cap = int(self.d["review_inline_diff_kb"]) * 1024
@@ -756,7 +762,7 @@ class Runner:
                 f.write(f"- Notes for next tasks: {so['notes_for_next_tasks']}\n")
             for dcs in so.get("decisions", []):
                 f.write(f"- Decision: {dcs}\n")
-        git(self.wt, "add", "-A")
+        self.stage()
         c = run(["git", "commit", "-m", f"{self.pid}({tid}): {task['title']}", "-m", summary[:3000]],
                 self.wt, check=False)
         if c.returncode != 0:
