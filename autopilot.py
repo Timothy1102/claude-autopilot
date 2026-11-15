@@ -1074,8 +1074,10 @@ class Runner:
         return f"autopilot {self.pid}: {parts}; ${self.state['total_cost_usd']:.2f}"
 
     def write_report(self):
+        n_done = sum(1 for s in self.state["tasks"].values() if s["status"] == "done")
         lines = [f"# Autopilot report — {self.pid}", "",
-                 f"- Updated: {ts()}", f"- Branch: `{self.branch}`", f"- Worktree: `{self.wt}`",
+                 f"- Updated: {ts()}", f"- Progress: {n_done}/{len(self.plan['tasks'])} tasks done",
+                 f"- Branch: `{self.branch}`", f"- Worktree: `{self.wt}`",
                  f"- Estimated cost so far: ${self.state['total_cost_usd']:.2f}",
                  f"- Run time so far: {fmt_dur(self.state['elapsed_seconds'])} "
                  f"(started {self.state.get('first_started_at', '-')})", "",
