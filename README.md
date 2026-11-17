@@ -202,7 +202,7 @@ When `autopilot run` executes inside a herdr pane (`HERDR_ENV=1`), it automatica
 | `defaults.max_model` / `max_effort` | Hard ceiling for every session (workers, fix-ups, reviewer, escalation). Defaults: `claude-opus-5-5` / `xhigh`; anything higher is clamped down. |
 | `defaults.max_budget_usd` | Cost ceiling per worker session, passed as `--max-budget-usd`. |
 | `defaults.limit_wait_minutes` / `max_limit_waits` | On a usage limit, sleep then `--resume` the same session. If the message includes a reset time the script sleeps exactly that long; `limit_wait_minutes` is only the fallback. After `max_limit_waits` the run stops and the task stays pending. |
-| `defaults.fixups` / `fixup_budget_usd` / `fixup_timeout_minutes` | Fix-up rounds in the same worker session before reset and escalation (default 1, extra $4 and 30 min per round). `task.fixups` overrides per task; `0` disables. |
+| `defaults.fixups` / `fixup_budget_usd` / `fixup_timeout_minutes` | Fix-up rounds in the same worker session before reset and escalation (default 2, extra $4 and 30 min per round). `task.fixups` overrides per task; `0` disables. |
 | `defaults.inline_spec_kb` | Inline `SPEC.md` (and the tail of PROGRESS/DECISIONS) in the prompt when the spec is at most this size (default 48). `0` makes the worker always read files itself. |
 | `defaults.review_inline_diff_kb` | Truncate the diff pasted to the reviewer at this size (default 120); the reviewer uses `git diff` for the rest. |
 | `defaults.stream_tools` | Default `false`. Set `true` to also print every tool call (🔧 Bash commands, file paths) in the live view. |

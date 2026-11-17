@@ -82,7 +82,7 @@ DEFAULTS = {
     # Cost/time controls. A rejected attempt (verify failed, reviewer asked for changes, commit hook
     # failed) is first handed back to the *same* session, which already holds the context and the
     # uncommitted work, before the tree is reset and a stronger model starts from scratch.
-    "fixups": 1,                    # fix-up rounds per attempt (0 = always reset and escalate)
+    "fixups": 2,                    # fix-up rounds per attempt (0 = always reset and escalate)
     "fixup_budget_usd": 4.0,        # extra budget each fix-up round may spend
     "fixup_timeout_minutes": 30,
     "inline_spec_kb": 48,           # paste SPEC/PROGRESS/DECISIONS into the prompt when SPEC.md is at most this size
