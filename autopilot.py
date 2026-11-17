@@ -37,6 +37,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -76,7 +77,8 @@ DEFAULTS = {
     "limit_wait_minutes": 30,       # sleep when a usage/rate limit is hit and the message gives no reset time
     "max_limit_waits": 16,
     "extra_args": [],               # appended to every `claude` call
-    "stream": True,                 # stream-json: live view of what each worker is doing
+    "stream": True,                 # stream-json: live view of what each worker is thinking/doing
+    "stream_tools": False,          # also show every tool call (Bash commands, file paths) in the live view
     # Cost/time controls. A rejected attempt (verify failed, reviewer asked for changes, commit hook
     # failed) is first handed back to the *same* session, which already holds the context and the
     # uncommitted work, before the tree is reset and a stronger model starts from scratch.
@@ -409,23 +411,38 @@ def parse_stream_result(lines):
     return None
 
 
-def describe_event(ev: dict):
-    """One short human-readable line per worker event, for the live view."""
+def describe_event(ev: dict, show_tools: bool = False):
+    """Human-readable messages for one worker event, for the live view.
+
+    By default only the model's own words are shown (its reasoning and running commentary); the raw
+    tool calls (Bash commands, file paths, ...) are noise and appear only with `stream_tools`."""
     if ev.get("type") != "assistant":
         return []
-    indent = "    ↳ " if ev.get("parent_tool_use_id") else ""
+    indent = "↳ " if ev.get("parent_tool_use_id") else ""
     out = []
     for block in (ev.get("message") or {}).get("content") or []:
-        if block.get("type") == "text" and block.get("text", "").strip():
-            txt = " ".join(block["text"].split())
-            out.append(f"{indent}💬 {txt[:160]}")
-        elif block.get("type") == "tool_use":
+        kind = block.get("type")
+        if kind == "thinking" and (block.get("thinking") or "").strip():
+            out.append(f"{indent}💭 " + " ".join(block["thinking"].split())[:600])
+        elif kind == "text" and (block.get("text") or "").strip():
+            out.append(f"{indent}💬 " + " ".join(block["text"].split())[:600])
+        elif kind == "tool_use" and show_tools:
             inp = block.get("input") or {}
             detail = next((str(inp[k]) for k in ("description", "command", "file_path", "pattern", "path",
                                                    "url", "query", "prompt") if inp.get(k)), "")
             detail = " ".join(detail.split())[:110]
             out.append(f"{indent}🔧 {block.get('name', '?')} {detail}".rstrip())
     return out
+
+
+def wrap_live(msg: str, prefix: str = "   │ ", max_lines: int = 4):
+    """Wrap one live-view message to the terminal width; continuation lines align under the text."""
+    width = max(50, shutil.get_terminal_size((110, 24)).columns - len(prefix) - 1)
+    lines = textwrap.wrap(msg, width=width, subsequent_indent="   ", break_long_words=True) or [msg]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1][:width - 1].rstrip() + "…"
+    return [prefix + ln for ln in lines]
 
 
 class Herdr:
@@ -515,7 +532,7 @@ def load_plan(tasks_path: Path):
         errors.append("defaults: 'full_verify_every' must be an integer >= 0")
     if not isinstance(d["verify_timeout_minutes"], (int, float)) or d["verify_timeout_minutes"] <= 0:
         errors.append("defaults: 'verify_timeout_minutes' must be a positive number")
-    for key in ("verify_parallel", "verify_fail_fast", "verify_cache"):
+    for key in ("verify_parallel", "verify_fail_fast", "verify_cache", "stream_tools"):
         if not isinstance(d[key], bool):
             errors.append(f"defaults: '{key}' must be true or false")
 
@@ -794,8 +811,8 @@ class Runner:
                         ev = json.loads(line)
                     except Exception:  # noqa: BLE001
                         continue
-                    for msg in describe_event(ev):
-                        print(f"   │ {msg}", flush=True)
+                    for msg in describe_event(ev, bool(self.d.get("stream_tools"))):
+                        print("\n".join(wrap_live(msg)), flush=True)
                         live_f.write(f"[{ts()}] {self.current} {msg}\n")
             proc.wait()
             timer.cancel()
@@ -936,7 +953,7 @@ class Runner:
         key = self.tree_key() if d["verify_cache"] else None
         cache = self.state.setdefault("verify_cache", {})
         files = self.changed_files(base) if any(CHANGED_FILES in c for c in cmds) else None
-        todo = []                                   # (shown, expanded, cache key)
+        todo, n_cached = [], 0                      # todo: (shown, expanded, cache key)
         for raw in cmds:
             cmd, why = expand_cmd(raw, files)
             if cmd is None:
@@ -944,14 +961,18 @@ class Runner:
                 continue
             ck = hashlib.sha256(f"{cmd}\0{key}".encode()).hexdigest() if key else None
             if ck and ck in cache:
+                n_cached += 1
                 self.log(f"{label}: ✓ `{raw}` (cached: tree unchanged since it last passed)")
                 continue
             todo.append((raw, cmd, ck))
         if not todo:
+            self.log(f"{label}: 🔍 verification passed ({n_cached} check(s), all cached)" if n_cached
+                     else f"{label}: 🔍 verification: nothing to check")
             return True, ""
         timeout_s = d["verify_timeout_minutes"] * 60
         mode = "in parallel" if d["verify_parallel"] and len(todo) > 1 else "sequentially"
-        self.log(f"{label}: running {len(todo)} check(s) {mode}")
+        self.log(f"{label}: 🔍 verification started: {len(todo)} check(s) {mode}"
+                 + (f", {n_cached} cached" if n_cached else ""))
         t0 = time.time()
         results = run_checks([c for _, c, _ in todo], self.wt, timeout_s,
                              parallel=d["verify_parallel"], fail_fast=d["verify_fail_fast"])
@@ -963,9 +984,12 @@ class Runner:
                 cache[ck] = ts()
         while len(cache) > 500:                     # keep state.json small; oldest entries go first
             cache.pop(next(iter(cache)))
+        took = fmt_secs(time.time() - t0)
         if all(r["state"] == "ok" for r in results):
-            self.log(f"{label}: all checks passed in {fmt_secs(time.time() - t0)}")
+            self.log(f"{label}: 🔍 verification passed in {took}")
             return True, ""
+        n_bad = sum(1 for r in results if r["state"] in ("failed", "timeout"))
+        self.log(f"{label}: 🔍 verification FAILED in {took} ({n_bad} failing check(s))")
         return False, format_check_failures(results, [raw for raw, _, _ in todo], timeout_s)
 
     def verify(self, task, start_head):
@@ -1010,6 +1034,7 @@ class Runner:
             f"\n\nDiff stat:\n{stat}\n\nStaged diff:\n{diff}\n"
         )
         r = self.d["reviewer"]
+        self.log(f"{task['id']}: 🧐 review started ({r['model'].replace('claude-', '')}/{r['effort']})")
         data, raw, cost = self.claude_call(
             prompt=prompt, model=r["model"], effort=r["effort"], schema=REVIEW_SCHEMA,
             rules_file=PROMPTS_DIR / "reviewer.md", budget=r["max_budget_usd"], tag=f"{task['id']}-review",
@@ -1020,6 +1045,8 @@ class Runner:
         if not so:
             self.log(f"{task['id']}: reviewer produced no verdict; accepting on verification alone")
             return True, [], cost, "reviewer unavailable"
+        if so.get("verdict") == "approve":
+            self.log(f"{task['id']}: 🧐 review approved")
         return so.get("verdict") == "approve", so.get("issues", []), cost, None
 
     # ---- one task
@@ -1084,7 +1111,7 @@ class Runner:
             if note:
                 entry["review_note"] = note
             if not approved:
-                self.log(f"{task['id']}: reviewer requested changes ({len(issues)} issues)")
+                self.log(f"{task['id']}: 🧐 review requested changes ({len(issues)} issue(s))")
                 return False, "A reviewer requested changes:\n" + "\n".join(f"- {i}" for i in issues), "review-rejected"
         return True, "", ""
 
@@ -1187,7 +1214,7 @@ class Runner:
                     st.update(status="done", summary=summary, commit=git(self.wt, "rev-parse", "--short", "HEAD"))
                     st.pop("last_feedback", None)
                     finish("done")
-                    self.log(f"{tid}: DONE ({st['commit']}, ${st['cost_usd']:.2f}, {fmt_dur(time.time() - started)})")
+                    self.log(f"✅ {tid}: DONE ({st['commit']}, ${st['cost_usd']:.2f}, {fmt_dur(time.time() - started)})")
                     return
 
                 sid = data.get("session_id")
@@ -1219,7 +1246,7 @@ class Runner:
 
         st.update(status="failed", last_feedback=feedback)
         self.reset_clean()
-        self.log(f"{tid}: FAILED after {st['attempts']} attempts")
+        self.log(f"❌ {tid}: FAILED after {st['attempts']} attempts")
         self.save()
 
     # ---- whole plan
