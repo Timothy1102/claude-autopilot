@@ -93,6 +93,8 @@ Set `review: true` on tasks where a wrong-but-green result would be costly (auth
 }
 ```
 
+If verification needs local services (a database, Docker, a dev stack), add `defaults.healthcheck` with cheap commands that fail when they are down, for example `["pg_isready -h 127.0.0.1 -p 54322 -d <db> -t 10", "docker info --format '{{.ServerVersion}}'"]`. An outage then pauses the run instead of failing tasks and escalating them to stronger models. List the files a worker must read in `context_files`; their current contents are pasted into its prompt.
+
 `setup` runs once, inside the new git worktree the orchestrator creates next to the repo (`../<repo>.autopilot-<plan-id>`), so copy any untracked files the tests need (such as `.env`) and install dependencies there. A fresh worktree has no build output (`dist/`, generated clients), so build workspace packages before any step that imports them (e.g. DB seeding). If setup fails it is retried on the next run.
 
 ## Phase 5 — Validate and hand off

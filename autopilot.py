@@ -26,6 +26,7 @@ Python 3.9+, standard library only.
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import datetime as dt
 import hashlib
@@ -67,11 +68,20 @@ DEFAULTS = {
     "verify_parallel": True,        # run the commands of one verification concurrently
     "verify_fail_fast": True,       # on the first failing command cancel the rest (False: report every failure)
     "verify_cache": True,           # skip a command that already passed on a content-identical tree
+    "verify_max_parallel": 0,       # cap on concurrently running checks (0 = all at once, at most 8)
+    "verify_flaky_retries": 1,      # re-run failed checks alone (one at a time) before rejecting the work
     "full_verify": [],              # heavy commands: tasks with "full_verify": true, every Nth task, final gate
     "full_verify_every": 0,         # also run full_verify after every Nth completed task (0 = off)
     "final_verify": None,           # list; run once when every task is done (default: verify + full_verify)
     "setup": [],                    # shell commands run once when the worktree is created
-    "review": False,                # run a reviewer session on every task's diff
+    # Environment health (database, Docker, local services). Checked before every attempt and whenever
+    # verification fails or a worker reports "blocked": a broken environment pauses the run instead of
+    # failing the task and escalating to a stronger model for a reason that has nothing to do with code.
+    "healthcheck": [],              # shell commands; all must exit 0 (e.g. "docker info", "pg_isready -h ...")
+    "healthcheck_timeout_seconds": 60,
+    "healthcheck_wait_minutes": 5,  # pause between checks while the environment is down
+    "max_health_waits": 12,         # then stop the run (task stays pending, attempt not counted)
+    "review": False,               # run a reviewer session on every task's diff
     "reviewer": {"model": "claude-opus-5-5", "effort": "high", "max_budget_usd": 4.0},
     "permission_mode": "auto",      # auto | acceptEdits | dontAsk | bypassPermissions
     "limit_wait_minutes": 30,       # sleep when a usage/rate limit is hit and the message gives no reset time
@@ -86,8 +96,24 @@ DEFAULTS = {
     "fixup_budget_usd": 4.0,        # extra budget each fix-up round may spend
     "fixup_timeout_minutes": 30,
     "inline_spec_kb": 48,           # paste SPEC/PROGRESS/DECISIONS into the prompt when SPEC.md is at most this size
+    "inline_context_kb": 24,        # paste the current contents of task.context_files (files only) up to this total
     "review_inline_diff_kb": 120,   # larger diffs are truncated; the reviewer runs `git diff` for the rest
+    "retry_diff_kb": 40,            # show a retry the rejected attempt's diff, up to this size (0 = off)
 }
+
+ENV_RECOVERED_MESSAGE = (
+    "The orchestrator found that the environment (database, Docker or another local service) was down, "
+    "waited until its health checks passed again, and is handing the task back to you. Your changes are "
+    "still in the working tree. Continue the task, re-run the verification commands, and end with the "
+    "structured result again.\n"
+)
+
+INTERRUPTED_NOTE = (
+    "\n\n## Note: this task was already started\n"
+    "A previous session working on this task was cut off by a usage limit on another account. Its partial "
+    "changes are still in the working tree: look at `git status` and `git diff` first and continue from "
+    "there instead of starting over.\n"
+)
 
 FIXUP_MESSAGE = (
     "The orchestrator checked your work and rejected it. Your changes are still in the working tree, "
@@ -99,11 +125,17 @@ FIXUP_MESSAGE = (
 class LimitExhausted(Exception):
     """The usage limit did not clear within max_limit_waits; the run should stop, not escalate."""
 
-# Workers must never touch git history; the orchestrator owns commits.
+
+class EnvironmentDown(Exception):
+    """defaults.healthcheck kept failing for max_health_waits; the run should stop, not blame the code."""
+
+# Workers must never touch git history; the orchestrator owns commits. Nor may they schedule
+# wake-ups: a `claude -p` worker that "checks back later" just sits idle while the clock runs.
 DENIED_TOOLS = ",".join([
     "Bash(git push)", "Bash(git push *)", "Bash(git commit)", "Bash(git commit *)",
     "Bash(git reset *)", "Bash(git rebase *)", "Bash(git switch *)",
     "Bash(git checkout -b *)", "Bash(git worktree *)", "Bash(git merge *)",
+    "ScheduleWakeup", "CronCreate",
 ])
 
 RESULT_SCHEMA = {
@@ -180,17 +212,87 @@ def parse_limit_wait(text: str, now: dt.datetime | None = None):
     return None
 
 
+STOP_KEY = "q"
+
+
 class Logger:
+    """Prints timestamped lines (and appends them to the log file). While `footer` is set and stdout is a
+    terminal, it stays pinned as the last line of the stream."""
+
     def __init__(self, path: Path | None):
         self.path = path
+        self.footer = ""
+        self._lock = threading.Lock()
+
+    def set_footer(self, text: str) -> None:
+        with self._lock:
+            self.footer = text
+            if sys.stdout.isatty():
+                print("\r\033[K" + text, end="", flush=True)
 
     def __call__(self, msg: str) -> None:
         line = f"[{ts()}] {msg}"
-        print(line, flush=True)
+        with self._lock:
+            if self.footer and sys.stdout.isatty():
+                print("\r\033[K" + line + "\n" + self.footer, end="", flush=True)
+            else:
+                print(line, flush=True)
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
+
+
+class StopKey:
+    """Watches the terminal for STOP_KEY (no Enter needed). Ctrl+C keeps working as usual."""
+
+    def __init__(self, log: Logger):
+        self.log, self.requested, self._old, self._fd = log, False, None, None
+        self._done = threading.Event()
+
+    def start(self) -> None:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return
+        try:
+            import termios
+            import tty
+            self._fd = sys.stdin.fileno()
+            self._old = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)          # unlike raw mode, keeps Ctrl+C -> SIGINT
+        except Exception:  # noqa: BLE001
+            self._old = None
+            return
+        self.log.set_footer(self._help())
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _help(self) -> str:
+        if self.requested:
+            return "⏳ stopping once the running task is finished (Ctrl+C to stop immediately)"
+        return f"Ctrl+C to stop immediately, '{STOP_KEY}' to stop when the running task is finished"
+
+    def _watch(self) -> None:
+        import select
+        while not self._done.is_set():
+            try:
+                if select.select([sys.stdin], [], [], 0.2)[0]:
+                    ch = os.read(self._fd, 1).decode(errors="ignore")
+                    if ch.lower() == STOP_KEY and not self.requested:
+                        self.requested = True
+                        self.log("stop requested: finishing the running task, then stopping")
+                        self.log.set_footer(self._help())
+            except Exception:  # noqa: BLE001
+                return
+
+    def close(self) -> None:
+        self._done.set()
+        if self._old is not None:
+            import termios
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+            self._old = None
+        if self.log.footer:
+            self.log.footer = ""
+            if sys.stdout.isatty():
+                print("\r\033[K", end="", flush=True)
 
 
 def _split_env_prefix(tokens):
@@ -244,6 +346,13 @@ def resolve_claude(spec: str, _depth: int = 0):
     raise SystemExit(f"'{argv[0]}' is not a program on PATH or a shell alias "
                      f"(shell functions are not supported; use a command like "
                      f"\"CLAUDE_CONFIG_DIR=~/.claude-x claude\")")
+
+
+def split_accounts(spec: str):
+    """--claude-bin may list several accounts, comma-separated ("claude,claude-personal"): the run
+    switches to the next one when the current one hits its usage limit instead of sleeping."""
+    parts = [p.strip() for p in (spec or "").split(",") if p.strip()]
+    return parts or ["claude"]
 
 
 def child_env() -> dict:
@@ -300,13 +409,14 @@ def _kill_group(p):
             pass
 
 
-def run_checks(cmds, cwd, timeout_s, parallel=True, fail_fast=True):
+def run_checks(cmds, cwd, timeout_s, parallel=True, fail_fast=True, max_parallel=0):
     """Run shell commands and return one result per command, in input order.
 
     Each result: {"cmd", "state", "rc", "out", "secs"} with state one of ok / failed / timeout /
     cancelled (killed because another command failed first) / notrun (never started, same reason).
     With parallel=True all commands start together, so the wall time is that of the slowest one;
     with fail_fast the first failure kills the others. Sequential mode stops at the first failure.
+    max_parallel > 0 caps how many run at once (heavy suites that each saturate the CPU).
     """
     results = [{"cmd": c, "state": "notrun", "rc": None, "out": "", "secs": 0.0, "cancelled": False}
                for c in cmds]
@@ -349,9 +459,10 @@ def run_checks(cmds, cwd, timeout_s, parallel=True, fail_fast=True):
             for q in procs.values():
                 _kill_group(q)
 
-    if parallel and len(cmds) > 1:
+    width = min(len(cmds), 8, max_parallel if max_parallel and max_parallel > 0 else 8)
+    if parallel and width > 1:
         # kill_all() must run before the pool's __exit__, which would wait for the running checks
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(cmds), 8)) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=width) as pool:
             try:
                 list(pool.map(one, range(len(cmds))))
             except BaseException:
@@ -525,11 +636,16 @@ def load_plan(tasks_path: Path):
         if v is not None and not (isinstance(v, list) and all(isinstance(c, str) and c for c in v)):
             errors.append(f"{where}: '{key}' must be a list of non-empty command strings")
 
-    for key in ("verify", "full_verify", "final_verify", "setup"):
+    for key in ("verify", "full_verify", "final_verify", "setup", "healthcheck"):
         cmd_list("defaults", d, key)
-    n = d.get("full_verify_every")
-    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
-        errors.append("defaults: 'full_verify_every' must be an integer >= 0")
+    for key in ("full_verify_every", "verify_max_parallel", "verify_flaky_retries", "max_health_waits",
+                "inline_context_kb", "retry_diff_kb"):
+        n = d.get(key)
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            errors.append(f"defaults: '{key}' must be an integer >= 0")
+    for key in ("healthcheck_timeout_seconds", "healthcheck_wait_minutes"):
+        if isinstance(d[key], bool) or not isinstance(d[key], (int, float)) or d[key] <= 0:
+            errors.append(f"defaults: '{key}' must be a positive number")
     if not isinstance(d["verify_timeout_minutes"], (int, float)) or d["verify_timeout_minutes"] <= 0:
         errors.append("defaults: 'verify_timeout_minutes' must be a positive number")
     for key in ("verify_parallel", "verify_fail_fast", "verify_cache", "stream_tools"):
@@ -564,6 +680,11 @@ def load_plan(tasks_path: Path):
     if uses_changed and not (d.get("full_verify") or d.get("final_verify")):
         warnings.append("verify uses {changed_files} but there is no full_verify / final_verify command: "
                         "nothing will run the whole suite. Add defaults.full_verify (or final_verify)")
+    if d.get("verify") and not d.get("full_verify") and not uses_changed and len(tasks) >= 6:
+        warnings.append(f"defaults.verify runs in full after each of the {len(tasks)} tasks, and every worker "
+                        "runs it too. If it contains the whole test suite or a build, keep only cheap checks "
+                        "there (typecheck, lint, tests of {changed_files}) and move the rest to "
+                        "defaults.full_verify with full_verify_every 3-4; the final gate still runs everything")
     spec = tasks_path.parent / "SPEC.md"
     if not spec.exists():
         errors.append(f"missing {spec}")
@@ -650,7 +771,13 @@ class Runner:
         self.state_path = self.run_dir / "state.json"
         self.crashed = False            # set by _load_state when a task was mid-run last time
         self.state = self._load_state()
-        self.claude, self.claude_env = ([args.claude_bin], {}) if args.dry_run else resolve_claude(args.claude_bin)
+        # One entry per account (--claude-bin "claude,claude-personal"): {"label", "argv", "env"}.
+        self.accounts = [{"label": spec, "argv": [spec], "env": {}} if args.dry_run else
+                         {"label": spec, **dict(zip(("argv", "env"), resolve_claude(spec)))}
+                         for spec in split_accounts(args.claude_bin)]
+        self.acct = 0                   # index of the account in use
+        self.limited_until = {}         # account index -> epoch seconds its usage limit is expected to reset
+        self.session_acct = {}          # session id -> account index (a session only resumes on its account)
         self.herdr = Herdr(disabled=args.dry_run)
         self.current = ""               # short description of what is running, for herdr
         self._elapsed_base = self.state["elapsed_seconds"]   # time from earlier invocations
@@ -773,12 +900,20 @@ class Runner:
         git(self.wt, "clean", "-fdq")
 
     # ---- claude
-    def _spawn(self, cmd, text_in, out_path, timeout_s, live):
+    def worker_env(self, acct):
+        """Environment of a claude session. BASH_MAX_TIMEOUT_MS lets a worker run a verification command
+        in the foreground for as long as the orchestrator would allow it, instead of starting it in the
+        background and polling it with sleep (the Bash tool's own cap is 10 minutes)."""
+        env = {**child_env(), **self.accounts[acct]["env"]}
+        env.setdefault("BASH_MAX_TIMEOUT_MS", str(int(self.d["verify_timeout_minutes"] * 60_000)))
+        return env
+
+    def _spawn(self, cmd, text_in, out_path, timeout_s, live, acct=0):
         """Run a worker, tee its stdout to out_path, print a live view, kill the group on timeout."""
         err_path = out_path.with_suffix(".stderr.txt")
         with open(err_path, "w", encoding="utf-8") as err_f, open(out_path, "w", encoding="utf-8") as out_f:
             proc = subprocess.Popen(cmd, cwd=str(self.wt), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=err_f, text=True, env={**child_env(), **self.claude_env},
+                                    stderr=err_f, text=True, env=self.worker_env(acct),
                                     start_new_session=True)
             timed_out = threading.Event()
 
@@ -821,20 +956,63 @@ class Runner:
             return -1, lines, stderr + "\nTIMEOUT: worker exceeded its time limit"
         return proc.returncode, lines, stderr
 
+    def _free_account(self, preferred=None):
+        """Index of an account that is not waiting for a usage-limit reset (preferring `preferred`,
+        then the one in use), or None when every account is limited."""
+        now = time.time()
+        free = [i for i in range(len(self.accounts)) if self.limited_until.get(i, 0) <= now]
+        for i in (preferred, self.acct):
+            if i in free:
+                return i
+        return free[0] if free else None
+
     def claude_call(self, *, prompt, model, effort, schema, rules_file, budget, tag,
                     permission_mode=None, allowed_tools=None, timeout_min=None,
-                    resume_sid=None, prev_total=0.0):
-        """Runs claude -p; waits and resumes on usage/rate limits. Returns (data|None, raw, cost_delta).
+                    resume_sid=None, prev_total=0.0, fresh_prompt=None, resume_note=INTERRUPTED_NOTE):
+        """Runs claude -p; on usage/rate limits switches account or waits. Returns (data|None, raw, cost_delta).
 
         resume_sid continues an existing session (fix-up rounds); prev_total is what that session had
-        already reported as total_cost_usd, so only the new spend is counted. Raises LimitExhausted when
-        the limit does not clear within max_limit_waits."""
+        already reported as total_cost_usd, so only the new spend is counted. A session can only be
+        resumed on the account that created it, so when that account is limited and another one is
+        free the call starts a new session there with fresh_prompt (default: `prompt` for a new
+        session; without it a resumed call waits for its own account). resume_note is appended to the
+        fresh prompt when an interrupted session already did part of the work. Raises LimitExhausted
+        when the limit does not clear within max_limit_waits sleeps."""
         model, effort = clamp(model, effort, self.d)
         waits, cost, text_in = 0, 0.0, prompt
+        fresh = fresh_prompt if fresh_prompt is not None else (None if resume_sid else prompt)
+        noted = False
         while True:
+            if resume_sid:
+                own = self.session_acct.get(resume_sid, self.acct)
+                acct = own if self.limited_until.get(own, 0) <= time.time() else None
+                if acct is None and fresh is not None:
+                    acct = self._free_account()
+                    if acct is not None:
+                        self.log(f"{tag}: {self.accounts[own]['label']} is at its usage limit; continuing "
+                                 f"in a new session on {self.accounts[acct]['label']}")
+                        resume_sid, prev_total, text_in = None, 0.0, fresh
+                reset_at = self.limited_until.get(own, 0)
+            else:
+                acct = self._free_account()
+                if acct is not None and acct != self.acct:
+                    self.log(f"{tag}: switching to {self.accounts[acct]['label']} "
+                             f"({self.accounts[self.acct]['label']} is at its usage limit)")
+                reset_at = min(self.limited_until.values()) if self.limited_until else 0
+            if acct is None:
+                if waits >= self.d["max_limit_waits"]:
+                    raise LimitExhausted(f"{tag}: usage limit still in place after {waits} waits")
+                waits += 1
+                wait_min = max(1, int(round((reset_at - time.time()) / 60)))
+                self.log(f"{tag}: usage/rate limit hit, sleeping {wait_min} min "
+                         f"(wait {waits}/{self.d['max_limit_waits']})")
+                self.herdr.report("working", f"{self.current}: waiting {wait_min} min for usage limit reset")
+                time.sleep(max(0.0, reset_at - time.time()))
+                continue
+            self.acct = acct
             stream = bool(self.d.get("stream", True))
             cmd = [
-                *self.claude, "-p",
+                *self.accounts[acct]["argv"], "-p",
                 "--model", model, "--effort", effort,
                 "--permission-mode", permission_mode or self.d["permission_mode"],
                 "--permission-prompts", "none",
@@ -856,7 +1034,7 @@ class Runner:
             n = len(list(logs.glob(f"{tag}-*.jsonl")))
             out_path = logs / f"{tag}-{n}.jsonl"
             rc, lines, stderr = self._spawn(cmd, text_in, out_path,
-                                            (timeout_min or self.d["timeout_minutes"]) * 60, live=stream)
+                                            (timeout_min or self.d["timeout_minutes"]) * 60, live=stream, acct=acct)
             stdout = "".join(lines)
             data = parse_stream_result(lines) if stream else None
             if data is None:
@@ -868,23 +1046,23 @@ class Runner:
                 # so a cumulative total strictly grows; anything else is this process's own spend.
                 cost += total - prev_total if total > prev_total else total
                 prev_total = total
+                if data.get("session_id"):
+                    self.session_acct[data["session_id"]] = acct
             raw = f"{stdout}\n{stderr}"
             errored = rc != 0 or (isinstance(data, dict) and data.get("is_error"))
             # Only look for limit messages in stderr and the final result, never in tool output
             # (a worker reading code about rate limiting must not look like a usage limit).
             limit_text = tail(stderr + "\n" + "".join(lines[-2:]) + "\n" + str((data or {}).get("result", "")), 4000)
             if errored and LIMIT_RE.search(limit_text):
-                if waits >= self.d["max_limit_waits"]:
-                    raise LimitExhausted(f"{tag}: usage limit still in place after {waits} waits")
-                waits += 1
+                wait_min = parse_limit_wait(limit_text) or self.d["limit_wait_minutes"]
+                self.limited_until[acct] = time.time() + wait_min * 60
+                self.log(f"{tag}: usage/rate limit hit on {self.accounts[acct]['label']} "
+                         f"(resets in about {wait_min} min)")
                 if isinstance(data, dict) and data.get("session_id"):
                     resume_sid = data["session_id"]
                     text_in = "You were interrupted by a usage/rate limit. Continue the task exactly where you left off."
-                wait_min = parse_limit_wait(limit_text) or self.d["limit_wait_minutes"]
-                self.log(f"{tag}: usage/rate limit hit, sleeping {wait_min} min "
-                         f"(wait {waits}/{self.d['max_limit_waits']})")
-                self.herdr.report("working", f"{self.current}: waiting {wait_min} min for usage limit reset")
-                time.sleep(wait_min * 60)
+                    if fresh is not None and resume_note and not noted:
+                        fresh, noted = fresh + resume_note, True
                 continue
             if errored:
                 return None, raw, cost
@@ -975,13 +1153,15 @@ class Runner:
                  + (f", {n_cached} cached" if n_cached else ""))
         t0 = time.time()
         results = run_checks([c for _, c, _ in todo], self.wt, timeout_s,
-                             parallel=d["verify_parallel"], fail_fast=d["verify_fail_fast"])
+                             parallel=d["verify_parallel"], fail_fast=d["verify_fail_fast"],
+                             max_parallel=d["verify_max_parallel"])
         for (raw, _, ck), r in zip(todo, results):
             mark = {"ok": "✓", "failed": "✗", "timeout": "✗"}.get(r["state"])
             if mark:
                 self.log(f"{label}: {mark} `{raw}` ({fmt_secs(r['secs'])})")
             if r["state"] == "ok" and ck:
                 cache[ck] = ts()
+        results = self._retry_flaky(todo, results, timeout_s, label, cache)
         while len(cache) > 500:                     # keep state.json small; oldest entries go first
             cache.pop(next(iter(cache)))
         took = fmt_secs(time.time() - t0)
@@ -991,6 +1171,79 @@ class Runner:
         n_bad = sum(1 for r in results if r["state"] in ("failed", "timeout"))
         self.log(f"{label}: 🔍 verification FAILED in {took} ({n_bad} failing check(s))")
         return False, format_check_failures(results, [raw for raw, _, _ in todo], timeout_s)
+
+    def _retry_flaky(self, todo, results, timeout_s, label, cache):
+        """Re-run failed checks one at a time, on a quieter machine, before calling the work broken.
+
+        Parallel suites can push the load so high that timing-sensitive tests time out; sending such a
+        failure to the worker costs a fix-up round or a full retry on a stronger model. A check that
+        fails and then passes alone is accepted, recorded under "flaky" in state.json and REPORT.md,
+        and not cached, so the final gate runs it again. Timeouts are not retried (a hang would
+        cost another full timeout); checks cancelled by the failure run again so the verdict is complete."""
+        failed = [i for i, r in enumerate(results) if r["state"] == "failed"]
+        if not failed or any(r["state"] == "timeout" for r in results):
+            return results
+        for round_ in range(int(self.d["verify_flaky_retries"])):
+            idx = [i for i in failed if results[i]["state"] != "ok"] + \
+                  [i for i, r in enumerate(results) if r["state"] in ("cancelled", "notrun")]
+            if not idx:
+                break
+            self.log(f"{label}: re-running {len(idx)} check(s) one at a time to rule out flakiness"
+                     + (f" (round {round_ + 1})" if round_ else ""))
+            again = run_checks([todo[i][1] for i in idx], self.wt, timeout_s, parallel=False, fail_fast=True)
+            for i, r in zip(idx, again):
+                if r["state"] == "notrun":
+                    continue
+                raw, _, ck = todo[i]
+                first = results[i]
+                if r["state"] == "ok" and first["state"] == "failed":
+                    self.log(f"{label}: ⚠️ `{raw}` failed, then passed when run alone ({fmt_secs(r['secs'])}): "
+                             "accepted, recorded as flaky")
+                    flaky = self.state.setdefault("flaky", [])
+                    flaky.append({"at": ts(), "where": label, "cmd": raw, "output": tail(first["out"], 1500)})
+                    del flaky[:-50]
+                else:
+                    mark = "✓" if r["state"] == "ok" else "✗"
+                    self.log(f"{label}: {mark} `{raw}` ({fmt_secs(r['secs'])}, re-run)")
+                    if r["state"] == "ok" and ck:
+                        cache[ck] = ts()
+                results[i] = r
+            if any(results[i]["state"] in ("failed", "timeout") for i in idx):
+                break
+        return results
+
+    def healthy(self):
+        """(ok, failure text) of defaults.healthcheck; (True, "") when none is configured."""
+        cmds = list(self.d["healthcheck"])
+        if not cmds:
+            return True, ""
+        timeout_s = float(self.d["healthcheck_timeout_seconds"])
+        res = run_checks(cmds, self.wt, timeout_s, parallel=False, fail_fast=True)
+        if all(r["state"] == "ok" for r in res):
+            return True, ""
+        return False, format_check_failures(res, cmds, timeout_s, limit=2000)
+
+    def wait_healthy(self, where):
+        """Block while the environment is down. Returns True if it was down and came back, False if it
+        was fine (or no healthcheck is configured). Raises EnvironmentDown after max_health_waits."""
+        ok, out = self.healthy()
+        if ok:
+            return False
+        wait_min, n_max = self.d["healthcheck_wait_minutes"], int(self.d["max_health_waits"])
+        self.log(f"{where}: 🩺 environment health check FAILED; not the code's fault, so nothing is retried "
+                 f"or escalated while it is down\n{tail(out, 1200)}")
+        for n in range(1, n_max + 1):
+            self.log(f"{where}: 🩺 waiting {wait_min} min for the environment (wait {n}/{n_max})")
+            self.herdr.report("blocked", f"{self.current}: environment down ({self.d['healthcheck'][0]} "
+                              f"fails), waiting; fix it and the run continues", resume_argv=self.resume_argv())
+            time.sleep(wait_min * 60)
+            ok, out = self.healthy()
+            if ok:
+                self.log(f"{where}: 🩺 environment healthy again")
+                self.herdr_progress(f"{self.current}: environment back, continuing")
+                return True
+        raise EnvironmentDown(f"environment health check still failing after {n_max} waits "
+                              f"of {wait_min} min:\n{tail(out, 1500)}")
 
     def verify(self, task, start_head):
         fast, heavy = self.check_list(task)
@@ -1038,7 +1291,7 @@ class Runner:
         data, raw, cost = self.claude_call(
             prompt=prompt, model=r["model"], effort=r["effort"], schema=REVIEW_SCHEMA,
             rules_file=PROMPTS_DIR / "reviewer.md", budget=r["max_budget_usd"], tag=f"{task['id']}-review",
-            permission_mode="dontAsk", timeout_min=30,
+            permission_mode="dontAsk", timeout_min=30, resume_note="",
             allowed_tools="Read,Grep,Glob,Bash(git diff *),Bash(git show *),Bash(git log *)",
         )
         so = (data or {}).get("structured_output") or {}
@@ -1060,17 +1313,51 @@ class Runner:
             return tail(text, limit_kb * 1024) if tail_only else None
         return text
 
-    def build_prompt(self, task, feedback):
-        rel = self.rel.as_posix()
-        # Pasting the plan files saves the worker three read round-trips per task (it would read
-        # them in full anyway); the logs are tailed so a long run does not bloat every prompt.
+    def worker_rules(self):
+        """System-prompt file for worker sessions: prompts/worker.md, plus SPEC.md when it is small
+        enough to inline. The spec is the same for every task of the run, so in the system prompt it
+        is part of the prefix that later sessions read from the prompt cache instead of paying for it
+        again (in the task message it would be re-written to the cache by every session)."""
         spec = self._plan_file("SPEC.md", int(self.d["inline_spec_kb"] or 0))
+        if spec is None:
+            return PROMPTS_DIR / "worker.md", False
+        path = self.run_dir / "worker-rules.md"
+        text = ((PROMPTS_DIR / "worker.md").read_text(encoding="utf-8")
+                + f"\n\n# SPEC.md of plan `{self.pid}` (`{self.rel.as_posix()}/SPEC.md`)\n\n"
+                "The spec below is binding for every task of this plan.\n\n" + spec)
+        if not path.exists() or path.read_text(encoding="utf-8") != text:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        return path, True
+
+    def _context_contents(self, task):
+        """Current contents of the task's context_files (files only, not directories), up to
+        inline_context_kb in total, so the worker does not spend its first turns reading them."""
+        budget = int(self.d["inline_context_kb"] or 0) * 1024
+        out = []
+        for f in task.get("context_files") or []:
+            p = self.wt / f
+            try:
+                if not p.is_file() or p.stat().st_size > budget:
+                    continue
+                text = p.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            budget -= len(text.encode("utf-8"))
+            fence = "~~~~~" if "~~~~" in text else "~~~~"
+            out.append(f"### `{f}`\n{fence}\n{text.rstrip()}\n{fence}")
+        return out
+
+    def build_prompt(self, task, feedback, prev_diff=None):
+        rel = self.rel.as_posix()
+        _, spec_in_system = self.worker_rules()
         files = f"`{rel}/SPEC.md`, `{rel}/PROGRESS.md`, `{rel}/DECISIONS.md`"
         parts = [
             f"# Autopilot task {task['id']}: {task['title']}",
-            (f"Plan `{self.pid}`. The spec, progress log and decisions log are included at the end of this "
-             f"message (files: {files}); do not re-read them unless a log is marked truncated.")
-            if spec is not None else f"Plan `{self.pid}`. Read first: {files}.",
+            (f"Plan `{self.pid}`. The spec is in your system prompt; the progress log and decisions log are "
+             f"included at the end of this message (files: {files}). Do not re-read them unless a log is "
+             "marked truncated.")
+            if spec_in_system else f"Plan `{self.pid}`. Read first: {files}.",
             "## What to do\n" + task["instructions"],
         ]
         if task.get("acceptance"):
@@ -1086,6 +1373,13 @@ class Runner:
                          "These heavy checks run after you finish, together with the ones above. You do not need to "
                          "run them yourself unless you are chasing a failure they would catch; a failure is sent back "
                          "to you.\n" + "\n".join(f"- `{c}`" for c in heavy))
+        if self.d["healthcheck"]:
+            parts.append("## If the environment breaks\n"
+                         "If a check fails because the environment is down (database or Docker not reachable, a local "
+                         "service not running) rather than because of your code, do not try to repair infrastructure "
+                         "or wait for it: return status \"blocked\" at once and say what is down. The orchestrator "
+                         "runs its own health checks, waits for the environment to recover and then hands the task "
+                         "back to this same session.")
         if any(CHANGED_FILES in c for c in fast + heavy):
             parts.append(f"`{CHANGED_FILES}` in a command stands for the space-separated, shell-quoted list of files "
                          "this task added or changed (for example from `git status --porcelain`); substitute it when "
@@ -1094,15 +1388,49 @@ class Runner:
             parts.append("## A previous attempt at this task was rejected\n"
                          "The working tree was reset to the last good commit. Avoid repeating the problem below.\n\n"
                          + feedback)
-        if spec is not None:
-            parts.append("## SPEC.md\n" + spec)
+        if feedback and prev_diff:
+            parts.append("## The rejected attempt's diff (reference only)\n"
+                         "This is what the previous attempt wrote before it was rejected for the reason above; none of it "
+                         "is in the tree any more. Reuse the parts that are right instead of rediscovering them, but "
+                         "judge every line yourself: the attempt was rejected, and the cause may be anywhere in it.\n\n"
+                         "~~~~diff\n" + prev_diff.rstrip() + "\n~~~~")
+        ctx = self._context_contents(task)
+        if ctx:
+            parts.append("## Contents of the relevant files at the start of this task\n"
+                         "Already read for you; you still have to open a file with the Read tool before editing it.\n\n"
+                         + "\n\n".join(ctx))
+        if spec_in_system:
             parts.append("## PROGRESS.md (what earlier tasks did)\n" + (self._plan_file("PROGRESS.md", 12, True) or ""))
             parts.append("## DECISIONS.md\n" + (self._plan_file("DECISIONS.md", 8, True) or ""))
         return "\n\n".join(parts) + "\n"
 
+    def attempt_diff(self, tid, attempt, start_head):
+        """Save the diff of a rejected attempt (before the tree is reset) and return it, bounded by
+        retry_diff_kb, for the next attempt's prompt; None when off or empty."""
+        cap = int(self.d["retry_diff_kb"] or 0) * 1024
+        if not cap:
+            return None
+        self.stage()
+        diff = git(self.wt, "diff", "--cached", start_head, "--", ".",
+                   f":(exclude){self.rel.as_posix()}/PROGRESS.md", f":(exclude){self.rel.as_posix()}/DECISIONS.md",
+                   check=False)
+        if not diff.strip():
+            return None
+        path = self.run_dir / "logs" / f"{tid}-a{attempt}.diff"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(diff + "\n", encoding="utf-8")
+        if len(diff) > cap:
+            stat = git(self.wt, "diff", "--cached", "--stat", start_head, check=False)
+            diff = (f"(diff of {len(diff) // 1024} KB truncated to {cap // 1024} KB; diff stat first)\n{stat}\n\n"
+                    + diff[:cap] + "\n…(truncated)…")
+        return diff
+
     def gate(self, task, start_head, entry, account):
         """Orchestrator-side checks of a worker's 'done'. Returns (ok, problem, outcome)."""
         ok, out = self.verify(task, start_head)
+        if not ok and self.wait_healthy(task["id"]):
+            # The environment was down, so that failure says nothing about the code: check again.
+            ok, out = self.verify(task, start_head)
         if not ok:
             return False, "Verification failed:\n" + out, "verify-failed"
         if task.get("review", self.d["review"]):
@@ -1132,14 +1460,32 @@ class Runner:
             return False, "The git pre-commit hook rejected the change:\n" + tail(c.stdout + c.stderr, 3000)
         return True, ""
 
+    def _resume(self, *, task, model, effort, rules, tag, data, message, first_prompt):
+        """Hand a message back to the worker's own session (fix-up round, environment recovered).
+        If that session's account is at its usage limit, a new session on another account gets the
+        original task message plus this one instead."""
+        fresh = (first_prompt + "\n\n## Your work so far\nAn earlier session did this task; its changes are "
+                 "still in the working tree (see `git status` and `git diff`). The orchestrator then sent it "
+                 "this message, which is now yours to act on:\n\n" + message)
+        return self.claude_call(
+            prompt=message, model=model, effort=effort, schema=RESULT_SCHEMA, rules_file=rules, tag=tag,
+            # --max-budget-usd counts only this process's spend, not the resumed session's past.
+            budget=float(self.d["fixup_budget_usd"]), timeout_min=self.d["fixup_timeout_minutes"],
+            resume_sid=data.get("session_id"), prev_total=float(data.get("total_cost_usd") or 0),
+            fresh_prompt=fresh,
+        )
+
     def run_task(self, task):
         tid, st = task["id"], self.state["tasks"][task["id"]]
         st["status"] = "running"
         self.save()
         feedback = st.get("last_feedback")
+        prev_diff = st.get("last_diff")
         max_fixups = int(task.get("fixups", self.d["fixups"]))
         budget = float(task.get("max_budget_usd", self.d["max_budget_usd"]))
         while st["attempts"] < task.get("max_attempts", self.d["max_attempts"]):
+            # A broken environment is not the code's fault: wait for it before the attempt counts.
+            self.wait_healthy(tid)
             st["attempts"] += 1
             attempt = st["attempts"]
             model, effort = pick_model(task, self.d, attempt)
@@ -1165,10 +1511,12 @@ class Runner:
                 entry["minutes"] = round((time.time() - started) / 60, 1)
                 self.save()
 
+            rules, _ = self.worker_rules()
+            first_prompt = self.build_prompt(task, feedback, prev_diff)
             try:
                 data, raw, cost = self.claude_call(
-                    prompt=self.build_prompt(task, feedback), model=model, effort=effort,
-                    schema=RESULT_SCHEMA, rules_file=PROMPTS_DIR / "worker.md", budget=budget,
+                    prompt=first_prompt, model=model, effort=effort,
+                    schema=RESULT_SCHEMA, rules_file=rules, budget=budget,
                     tag=f"{tid}-a{attempt}", timeout_min=task.get("timeout_minutes"),
                 )
             except LimitExhausted:
@@ -1181,7 +1529,7 @@ class Runner:
             account(cost)
             entry["session_id"] = (data or {}).get("session_id")
 
-            fixups = 0
+            fixups, env_resumes = 0, 0
             while True:
                 # One worker result per iteration: the first from a fresh session, later ones from
                 # fix-up rounds in the same session. Leaving this loop means reset + next attempt.
@@ -1194,6 +1542,21 @@ class Runner:
                 status = so.get("status", "unreported")
                 summary = so.get("summary") or tail(data.get("result", ""), 1500)
 
+                if status == "blocked" and data.get("session_id") and env_resumes < 2 and self.wait_healthy(tid):
+                    # The worker was stuck on a database/Docker/service outage that is now over.
+                    env_resumes += 1
+                    self.log(f"{tid}: the worker reported blocked while the environment was down; "
+                             "it is back, so the task goes back to the same session")
+                    try:
+                        data, raw, cost = self._resume(task=task, model=model, effort=effort, rules=rules,
+                                                       tag=f"{tid}-a{attempt}-env{env_resumes}", data=data,
+                                                       message=ENV_RECOVERED_MESSAGE, first_prompt=first_prompt)
+                    except LimitExhausted:
+                        st["status"] = "pending"
+                        finish("limit")
+                        raise
+                    account(cost)
+                    continue
                 if status == "blocked":
                     st.update(status="blocked", question=so.get("question", summary),
                               recommended_answer=so.get("recommended_answer", ""))
@@ -1213,26 +1576,21 @@ class Runner:
                 if ok:
                     st.update(status="done", summary=summary, commit=git(self.wt, "rev-parse", "--short", "HEAD"))
                     st.pop("last_feedback", None)
+                    st.pop("last_diff", None)
                     finish("done")
                     self.log(f"✅ {tid}: DONE ({st['commit']}, ${st['cost_usd']:.2f}, {fmt_dur(time.time() - started)})")
                     return
 
-                sid = data.get("session_id")
-                if fixups < max_fixups and sid:
+                if fixups < max_fixups and data.get("session_id"):
                     fixups += 1
                     entry["fixups"] = fixups
                     self.log(f"{tid}: {outcome}; asking the same session to fix it (fix-up {fixups}/{max_fixups})")
                     self.current = f"{tid} a{attempt} fix{fixups}"
                     self.herdr_progress(f"{label} · fix-up {fixups}")
                     try:
-                        data, raw, cost = self.claude_call(
-                            prompt=FIXUP_MESSAGE + problem, model=model, effort=effort, schema=RESULT_SCHEMA,
-                            rules_file=PROMPTS_DIR / "worker.md", tag=f"{tid}-a{attempt}-fix{fixups}",
-                            # --max-budget-usd counts only this process's spend, not the resumed session's past.
-                            budget=float(self.d["fixup_budget_usd"]),
-                            timeout_min=self.d["fixup_timeout_minutes"],
-                            resume_sid=sid, prev_total=float(data.get("total_cost_usd") or 0),
-                        )
+                        data, raw, cost = self._resume(task=task, model=model, effort=effort, rules=rules,
+                                                       tag=f"{tid}-a{attempt}-fix{fixups}", data=data,
+                                                       message=FIXUP_MESSAGE + problem, first_prompt=first_prompt)
                     except LimitExhausted:
                         st["status"] = "pending"
                         finish("limit")
@@ -1243,6 +1601,13 @@ class Runner:
                 self.log(f"{tid}: {outcome}")
                 finish(outcome)
                 break
+
+            # Keep what the rejected attempt wrote, so the next one can reuse the good parts.
+            prev_diff = self.attempt_diff(tid, attempt, start_head)
+            if prev_diff:
+                st["last_diff"] = prev_diff
+            else:
+                st.pop("last_diff", None)
 
         st.update(status="failed", last_feedback=feedback)
         self.reset_clean()
@@ -1262,7 +1627,11 @@ class Runner:
                   f"{', fail-fast' if d['verify_fail_fast'] else ''}"
                   f"{', cached on unchanged tree' if d['verify_cache'] else ''}; "
                   f"full tier ({len(d['full_verify'])} cmd) every {d['full_verify_every'] or 'no'} task(s) "
-                  f"or where task.full_verify; final gate: {len(self.final_commands())} cmd\n")
+                  f"or where task.full_verify; final gate: {len(self.final_commands())} cmd; "
+                  f"failed checks re-run alone {d['verify_flaky_retries']}x before rejecting\n")
+            print(f"  environment healthcheck: {len(d['healthcheck'])} cmd"
+                  f"{' before every attempt and on failures' if d['healthcheck'] else ' (none: outages fail tasks)'}"
+                  f"; accounts: {', '.join(a['label'] for a in self.accounts)}\n")
             for i, t in enumerate(order):
                 m, e = pick_model(t, self.d, 1)
                 m2, e2 = pick_model(t, self.d, 2)
@@ -1273,18 +1642,28 @@ class Runner:
                 print(f"  {t['id']:<6} {m}/{e:<7} (retry: {m2}/{e2})  verify={tier:<5} deps={deps}  {t['title']}")
             print("\n  verify=fast* means defaults.verify is skipped for that task (skip_default_verify)")
             return
-        version = run([*self.claude, "--version"], self.repo, check=False, extra_env=self.claude_env)
-        if version.returncode != 0:
-            raise SystemExit(f"cannot run '{' '.join(self.claude)} --version'")
-        self.log(f"claude {version.stdout.strip()} — starting plan {self.pid}")
+        for a in self.accounts:
+            version = run([*a["argv"], "--version"], self.repo, check=False, extra_env=a["env"])
+            if version.returncode != 0:
+                raise SystemExit(f"cannot run '{' '.join(a['argv'])} --version' (from --claude-bin {a['label']})")
+        self.log(f"claude {version.stdout.strip()} — starting plan {self.pid}"
+                 + (f" (accounts: {', '.join(a['label'] for a in self.accounts)})" if len(self.accounts) > 1 else ""))
         if self.herdr.enabled:
             self.log(f"herdr detected (pane {self.herdr.pane}): reporting state to the sidebar")
         self.herdr_progress("preparing worktree")
         self.ensure_worktree()
         self.state.pop("final_verify", None)    # stale once the plan is run again
+        self.state.pop("stop_reason", None)
         self.save()
+        self.stopkey = StopKey(self.log)
+        self.stopkey.start()
+        atexit.register(self.stopkey.close)
         try:
             while True:
+                if self.stopkey.requested:
+                    self.state["stop_reason"] = "stopped by you"
+                    self.log("stopped as requested; rerun the same command to resume")
+                    raise StopIteration
                 progressed = False
                 for t in order:
                     st = self.state["tasks"][t["id"]]
@@ -1300,6 +1679,7 @@ class Runner:
                     if any(v != "done" for v in dep_status.values()):
                         continue
                     if self.args.max_total_usd and self.state["total_cost_usd"] >= self.args.max_total_usd:
+                        self.state["stop_reason"] = "budget"
                         self.log(f"total budget ${self.args.max_total_usd} reached; stopping")
                         raise StopIteration
                     self.run_task(t)
@@ -1311,24 +1691,40 @@ class Runner:
         except StopIteration:
             pass
         except LimitExhausted as e:
+            self.state["stop_reason"] = "usage limit"
             self.log(f"{e}; stopping instead of escalating. Rerun the same command once your usage limit resets.")
+        except EnvironmentDown as e:
+            # The interrupted attempt is given back (it says nothing about the code) and its unverified
+            # changes are discarded, so the rerun starts the task again on the same model.
+            for s in self.state["tasks"].values():
+                if s["status"] == "running":
+                    s["status"] = "pending"
+                    self._refund_attempt(s)
+            self.reset_clean()
+            self.state["stop_reason"] = "environment down"
+            self.state["environment_error"] = str(e)
+            self.save()
+            self.log(f"{e}\nstopping: fix the environment (see defaults.healthcheck), then rerun the same command")
         except KeyboardInterrupt:
             for s in self.state["tasks"].values():
                 if s["status"] == "running":
                     s["status"] = "pending"
                     self._refund_attempt(s)
             self.save()
+            self.stopkey.close()
             self.log("interrupted; state saved, rerun the same command to resume")
             self.herdr.release()
             sys.exit(130)
-        if all(s["status"] == "done" for s in self.state["tasks"].values()):
+        if all(s["status"] == "done" for s in self.state["tasks"].values()) and not self.stopkey.requested:
             try:
                 self.final_gate()
             except KeyboardInterrupt:
+                self.stopkey.close()
                 self.log("interrupted during final verification; rerun the same command to repeat it")
                 self.herdr.release()
                 sys.exit(130)
         self.save()
+        self.stopkey.close()
         summary = self.short_summary()
         self.log(f"finished. {summary}. Report: {self.run_dir / 'REPORT.md'}")
         if self.args.notify_cmd:
@@ -1377,7 +1773,8 @@ class Runner:
         if needs_you or c.get("pending", 0) or final_failed:
             msg = (f"{needs_you} task(s) need you" if needs_you
                    else "final verification failed" if final_failed
-                   else f"stopped early (budget or usage limit), {c['pending']} task(s) pending")
+                   else f"stopped early ({self.state.get('stop_reason') or 'budget or usage limit'}), "
+                        f"{c['pending']} task(s) pending")
             msg += f": see {self.rel.as_posix()}/run/REPORT.md"
             self.herdr.report("blocked", msg, resume_argv=self.resume_argv())
             self.herdr.notify(f"autopilot {self.pid} needs you", summary, sound="request")
@@ -1423,6 +1820,7 @@ class Runner:
                  f"- Tasks done: {', '.join(done_tasks) or '-'}",
                  f"- Tasks NOT done: {', '.join(todo_tasks) or '-'}",
                  f"- Final verification: {self._final_line()}",
+                 *([f"- Stopped early: {self.state['stop_reason']}"] if self.state.get("stop_reason") else []),
                  f"- Branch: `{self.branch}`", f"- Worktree: `{self.wt}`",
                  f"- Estimated cost so far: ${self.state['total_cost_usd']:.2f}",
                  f"- Run time so far: {fmt_dur(self.state['elapsed_seconds'])} "
@@ -1441,8 +1839,13 @@ class Runner:
         blocked = [(t, self.state["tasks"][t["id"]]) for t in self.plan["tasks"]
                    if self.state["tasks"][t["id"]]["status"] in ("blocked", "failed")]
         fv = self.state.get("final_verify")
-        if blocked or (fv and not fv["ok"]):
+        env_err = self.state.get("environment_error") if self.state.get("stop_reason") == "environment down" else None
+        if blocked or (fv and not fv["ok"]) or env_err:
             lines += ["", "## Needs you"]
+            if env_err:
+                lines.append("\n### The environment is down\n- `defaults.healthcheck` kept failing, so the run "
+                             "stopped instead of failing tasks. Fix it (Docker, database, services), then rerun "
+                             "the same command.\n\n```\n" + tail(env_err, 2000) + "\n```")
             if fv and not fv["ok"]:
                 lines.append(f"\n### Final verification failed (commit {fv['commit']})\n"
                              "- Every task passed its own gate, so this is probably an interaction between tasks. "
@@ -1457,6 +1860,13 @@ class Runner:
                         lines.append(f"- Worker's proposed answer: {s['recommended_answer']}")
                 if s.get("last_feedback"):
                     lines.append("- Last failure:\n\n```\n" + tail(s["last_feedback"], 2000) + "\n```")
+        flaky = self.state.get("flaky") or []
+        if flaky:
+            lines += ["", "## Flaky checks",
+                      "These failed, then passed when re-run alone, and were accepted. Usually load-sensitive "
+                      "timeouts; a real race condition looks the same, so check any that repeat.", ""]
+            for f in flaky[-20:]:
+                lines.append(f"- {f['at']} · {f['where']} · `{f['cmd']}`")
         lines += ["", "## Next steps",
                   f"- Review: `git log --oneline {self.branch}` and `git diff <base>...{self.branch}`",
                   "- Answer questions by editing SPEC.md / tasks.json in your main checkout, then "
@@ -1479,7 +1889,8 @@ def add_run_options(p):
     p.add_argument("--no-hold", action="store_true", help="inside herdr: exit when done instead of waiting for Enter")
     p.add_argument("--claude-bin", "--claude", default=os.environ.get("AUTOPILOT_CLAUDE", "claude"),
                    help="claude command to run workers with: a binary, a shell alias such as claude-work, "
-                        "or 'VAR=val claude' (default: $AUTOPILOT_CLAUDE or claude)")
+                        "or 'VAR=val claude'. Comma-separate several accounts (claude,claude-work) to switch "
+                        "to the next one on a usage limit instead of sleeping (default: $AUTOPILOT_CLAUDE or claude)")
 
 
 def passthrough(args):
