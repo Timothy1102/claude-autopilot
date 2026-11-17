@@ -3,7 +3,7 @@
 Versioning follows [SemVer](https://semver.org). The version lives in `__version__` in `autopilot.py`.
 
 ## Unreleased
-- Graceful stop: press `q` during `autopilot run` to stop once the running task is finished (state saved, rerun to resume); Ctrl+C still stops immediately. A help line is pinned at the end of the log stream.
+- Graceful stop: press `q` during `autopilot run` to stop once the running task is finished (state saved, rerun to resume); Ctrl+C still stops immediately. A dimmed help line stays pinned on the bottom row of the terminal (scroll region), two blank rows below the log.
 - Environment health checks (`defaults.healthcheck`): checked before every attempt, when verification fails and when a worker reports `blocked`. A down environment pauses the run instead of failing the task and escalating; a failed verification is re-run once it is back, a worker blocked by the outage gets the task back in its own session, and if it never recovers the run stops with the attempt not counted.
 - Flaky checks: a failed check is re-run alone before the work is rejected (`verify_flaky_retries`, default 1); a pass on the re-run is accepted, listed in REPORT.md and not cached. `verify_max_parallel` caps concurrent checks.
 - Workers can no longer use `ScheduleWakeup` / `CronCreate`, and get `BASH_MAX_TIMEOUT_MS` = `verify_timeout_minutes`, so checks run in the foreground instead of being polled with `sleep`.

@@ -216,27 +216,56 @@ STOP_KEY = "q"
 
 
 class Logger:
-    """Prints timestamped lines (and appends them to the log file). While `footer` is set and stdout is a
-    terminal, it stays pinned as the last line of the stream."""
+    """Prints timestamped lines (and appends them to the log file). `footer` is drawn on the bottom row of
+    the terminal, outside the scrolling region, so it stays put while everything else scrolls above it."""
+
+    FOOTER_GAP = 2      # blank rows between the scrolling output and the footer
 
     def __init__(self, path: Path | None):
         self.path = path
         self.footer = ""
-        self._lock = threading.Lock()
+        self.pinned = False
+        self._lock = threading.RLock()
+
+    def _rows(self) -> int:
+        return shutil.get_terminal_size((80, 24)).lines
+
+    def _draw(self) -> None:
+        rows = self._rows()
+        sys.stdout.write(f"\0337\033[{rows};1H\033[2K\033[2m{self.footer}\033[0m\0338")
+        sys.stdout.flush()
+
+    def pin(self, text: str) -> None:
+        """Reserve the bottom rows of the terminal for `text`."""
+        if not sys.stdout.isatty():
+            return
+        with self._lock:
+            rows, reserve = self._rows(), self.FOOTER_GAP + 1
+            if not self.pinned:
+                sys.stdout.write("\n" * reserve)      # scroll existing output up to make room
+            self.footer, self.pinned = text, True
+            sys.stdout.write(f"\033[1;{rows - reserve}r\033[{rows - reserve};1H")
+            self._draw()
 
     def set_footer(self, text: str) -> None:
         with self._lock:
             self.footer = text
-            if sys.stdout.isatty():
-                print("\r\033[K" + text, end="", flush=True)
+            if self.pinned:
+                self._draw()
+
+    def unpin(self) -> None:
+        with self._lock:
+            if not self.pinned:
+                return
+            rows = self._rows()
+            self.pinned, self.footer = False, ""
+            sys.stdout.write(f"\033[r\033[{rows};1H\033[2K")
+            sys.stdout.flush()
 
     def __call__(self, msg: str) -> None:
         line = f"[{ts()}] {msg}"
         with self._lock:
-            if self.footer and sys.stdout.isatty():
-                print("\r\033[K" + line + "\n" + self.footer, end="", flush=True)
-            else:
-                print(line, flush=True)
+            print(line, flush=True)
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as f:
@@ -262,7 +291,8 @@ class StopKey:
         except Exception:  # noqa: BLE001
             self._old = None
             return
-        self.log.set_footer(self._help())
+        self.log.pin(self._help())
+        signal.signal(signal.SIGWINCH, lambda *_: self.log.pin(self.log.footer))
         threading.Thread(target=self._watch, daemon=True).start()
 
     def _help(self) -> str:
@@ -289,10 +319,7 @@ class StopKey:
             import termios
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
             self._old = None
-        if self.log.footer:
-            self.log.footer = ""
-            if sys.stdout.isatty():
-                print("\r\033[K", end="", flush=True)
+        self.log.unpin()
 
 
 def _split_env_prefix(tokens):
