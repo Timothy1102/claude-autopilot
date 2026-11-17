@@ -26,7 +26,9 @@ Python 3.9+, standard library only.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -57,8 +59,16 @@ DEFAULTS = {
     "max_attempts": 3,
     "max_budget_usd": 8.0,          # per worker session (passed to --max-budget-usd)
     "timeout_minutes": 90,          # per worker session
-    "verify": [],                   # shell commands run after every task
+    # Verification. `verify` is the fast tier that gates every task; `full_verify` is the heavy tier
+    # (full test suite, build) that only runs at checkpoints; `final_verify` gates the finished plan.
+    "verify": [],                   # shell commands run after every task; may use {changed_files}
     "verify_timeout_minutes": 30,
+    "verify_parallel": True,        # run the commands of one verification concurrently
+    "verify_fail_fast": True,       # on the first failing command cancel the rest (False: report every failure)
+    "verify_cache": True,           # skip a command that already passed on a content-identical tree
+    "full_verify": [],              # heavy commands: tasks with "full_verify": true, every Nth task, final gate
+    "full_verify_every": 0,         # also run full_verify after every Nth completed task (0 = off)
+    "final_verify": None,           # list; run once when every task is done (default: verify + full_verify)
     "setup": [],                    # shell commands run once when the worktree is created
     "review": False,                # run a reviewer session on every task's diff
     "reviewer": {"model": "claude-opus-5-5", "effort": "high", "max_budget_usd": 4.0},
@@ -131,6 +141,11 @@ def ts() -> str:
 def fmt_dur(seconds: float) -> str:
     m = int(round(seconds / 60))
     return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def fmt_secs(seconds: float) -> str:
+    """Like fmt_dur but with second resolution below a minute (for checks that take seconds)."""
+    return f"{seconds:.1f}s" if seconds < 60 else fmt_dur(seconds)
 
 
 def tail(text: str, n: int = 6000) -> str:
@@ -248,6 +263,121 @@ def run(cmd, cwd, check=True, timeout=None, input_text=None, shell=False, extra_
     if check and p.returncode != 0:
         raise RuntimeError(f"command failed ({p.returncode}): {cmd}\n{p.stdout}\n{p.stderr}")
     return p
+
+
+CHANGED_FILES = "{changed_files}"
+MAX_CHANGED_ARG = 100_000   # bytes of file names we are willing to put on one command line
+
+
+def dedupe(items):
+    return list(dict.fromkeys(items))
+
+
+def expand_cmd(cmd, files):
+    """Substitute {changed_files}. Returns (command, None) or (None, reason it has to be skipped).
+
+    `files` is None when the change set cannot be determined. A command without the placeholder is
+    returned unchanged. Skipping is safe because the full tier and the final gate still run."""
+    if CHANGED_FILES not in cmd:
+        return cmd, None
+    if files is None:
+        return None, "cannot determine the changed files"
+    if not files:
+        return None, "no changed files"
+    joined = " ".join(shlex.quote(f) for f in files)
+    if len(joined) > MAX_CHANGED_ARG:
+        return None, f"{len(files)} changed files do not fit on a command line"
+    return cmd.replace(CHANGED_FILES, joined), None
+
+
+def _kill_group(p):
+    if p.poll() is None:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)   # the shell and everything it spawned
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def run_checks(cmds, cwd, timeout_s, parallel=True, fail_fast=True):
+    """Run shell commands and return one result per command, in input order.
+
+    Each result: {"cmd", "state", "rc", "out", "secs"} with state one of ok / failed / timeout /
+    cancelled (killed because another command failed first) / notrun (never started, same reason).
+    With parallel=True all commands start together, so the wall time is that of the slowest one;
+    with fail_fast the first failure kills the others. Sequential mode stops at the first failure.
+    """
+    results = [{"cmd": c, "state": "notrun", "rc": None, "out": "", "secs": 0.0, "cancelled": False}
+               for c in cmds]
+    procs, lock, stop = {}, threading.Lock(), threading.Event()
+
+    def one(i):
+        r = results[i]
+        with lock:
+            if stop.is_set():   # set only by a fail-fast failure or by kill_all()
+                return
+            r["state"] = "running"
+            p = procs[i] = subprocess.Popen(
+                r["cmd"], cwd=str(cwd), shell=True, executable="/bin/bash", stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+                env=child_env(), start_new_session=True,
+            )
+        t0 = time.time()
+        try:
+            out, _ = p.communicate(timeout=timeout_s)
+            state = "ok" if p.returncode == 0 else "failed"
+        except subprocess.TimeoutExpired:
+            _kill_group(p)
+            out, _ = p.communicate()
+            state = "timeout"
+        with lock:
+            if r["cancelled"] and state == "failed":
+                state = "cancelled"
+            r.update(state=state, rc=p.returncode, out=out or "", secs=time.time() - t0)
+            if fail_fast and state in ("failed", "timeout"):
+                stop.set()
+                for j, q in procs.items():
+                    if j != i and results[j]["state"] == "running":
+                        results[j]["cancelled"] = True
+                        _kill_group(q)
+
+    def kill_all():
+        # Ctrl+C: the checks run in their own sessions and never see the terminal's SIGINT.
+        with lock:
+            stop.set()
+            for q in procs.values():
+                _kill_group(q)
+
+    if parallel and len(cmds) > 1:
+        # kill_all() must run before the pool's __exit__, which would wait for the running checks
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(cmds), 8)) as pool:
+            try:
+                list(pool.map(one, range(len(cmds))))
+            except BaseException:
+                kill_all()
+                raise
+    else:
+        try:
+            for i in range(len(cmds)):
+                one(i)
+        except BaseException:
+            kill_all()
+            raise
+    return results
+
+
+def format_check_failures(results, shown, timeout_s, limit=6000):
+    """Message for the worker: every failed command with the tail of its output."""
+    bad = [(shown[i], r) for i, r in enumerate(results) if r["state"] in ("failed", "timeout")]
+    per = max(1500, limit // max(1, len(bad)))
+    chunks = []
+    for label, r in bad:
+        head = f"$ {label}\n" + (f"(timed out after {fmt_secs(timeout_s)})" if r["state"] == "timeout"
+                                 else f"(exit {r['rc']})")
+        chunks.append(head + "\n" + tail(r["out"], per))
+    n_other = sum(1 for r in results if r["state"] in ("cancelled", "notrun"))
+    if n_other:
+        chunks.append(f"({n_other} other check(s) were cancelled or not run because of the failure above)")
+    return "\n\n".join(chunks)
 
 
 def parse_json_output(stdout: str):
@@ -372,6 +502,24 @@ def load_plan(tasks_path: Path):
     if len(ids) != len(set(ids)) or not all(ids):
         errors.append("every task needs a unique, non-empty id")
     idset = set(ids)
+
+    def cmd_list(where, obj, key):
+        v = obj.get(key)
+        if v is not None and not (isinstance(v, list) and all(isinstance(c, str) and c for c in v)):
+            errors.append(f"{where}: '{key}' must be a list of non-empty command strings")
+
+    for key in ("verify", "full_verify", "final_verify", "setup"):
+        cmd_list("defaults", d, key)
+    n = d.get("full_verify_every")
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        errors.append("defaults: 'full_verify_every' must be an integer >= 0")
+    if not isinstance(d["verify_timeout_minutes"], (int, float)) or d["verify_timeout_minutes"] <= 0:
+        errors.append("defaults: 'verify_timeout_minutes' must be a positive number")
+    for key in ("verify_parallel", "verify_fail_fast", "verify_cache"):
+        if not isinstance(d[key], bool):
+            errors.append(f"defaults: '{key}' must be true or false")
+
+    uses_changed = any(CHANGED_FILES in c for c in (d.get("verify") or []) if isinstance(c, str))
     for t in tasks:
         tid = t.get("id")
         for key in ("title", "instructions"):
@@ -380,13 +528,25 @@ def load_plan(tasks_path: Path):
         for dep in t.get("depends_on", []):
             if dep not in idset:
                 errors.append(f"{tid}: depends_on unknown task {dep}")
-        if not (t.get("verify") or d["verify"]):
+        cmd_list(str(tid), t, "verify")
+        for key in ("skip_default_verify", "full_verify"):
+            if t.get(key) is not None and not isinstance(t[key], bool):
+                errors.append(f"{tid}: '{key}' must be true or false")
+        own = [c for c in (t.get("verify") or []) if isinstance(c, str)]
+        uses_changed = uses_changed or any(CHANGED_FILES in c for c in own)
+        effective = own + ([] if t.get("skip_default_verify") else list(d.get("verify") or []))
+        if not effective:
             warnings.append(f"{tid}: no verify commands — only the worker's self-report will be checked")
+        if t.get("full_verify") and not d.get("full_verify"):
+            warnings.append(f"{tid}: full_verify is true but defaults.full_verify is empty")
         if not t.get("acceptance"):
             warnings.append(f"{tid}: no acceptance criteria")
         m = t.get("model", d["model"])
         if m not in MODEL_LADDER and m not in ("opus", "sonnet", "haiku", "fable"):
             warnings.append(f"{tid}: model '{m}' is not in the known ladder; escalation will only bump effort")
+    if uses_changed and not (d.get("full_verify") or d.get("final_verify")):
+        warnings.append("verify uses {changed_files} but there is no full_verify / final_verify command: "
+                        "nothing will run the whole suite. Add defaults.full_verify (or final_verify)")
     spec = tasks_path.parent / "SPEC.md"
     if not spec.exists():
         errors.append(f"missing {spec}")
@@ -537,6 +697,8 @@ class Runner:
             else:
                 git(self.repo, "worktree", "add", "-b", self.branch, str(self.wt), base)
             created = True
+            if not has_branch:
+                self.state["base_commit"] = git(self.wt, "rev-parse", "HEAD")   # for {changed_files} in the final gate
             self.log(f"created worktree {self.wt} on branch {self.branch} (from {base})")
         elif git(self.wt, "status", "--porcelain"):
             if self.crashed or self.args.force_clean:
@@ -712,15 +874,126 @@ class Runner:
             return data, raw, cost
 
     # ---- verification
-    def verify(self, task):
-        for cmd in task.get("verify", []) + self.d["verify"]:
-            try:
-                p = run(cmd, self.wt, check=False, shell=True, timeout=self.d["verify_timeout_minutes"] * 60)
-            except subprocess.TimeoutExpired:
-                return False, f"$ {cmd}\n(timed out)"
-            if p.returncode != 0:
-                return False, f"$ {cmd}\n(exit {p.returncode})\n{tail(p.stdout + p.stderr)}"
-        return True, ""
+    def wants_full(self, task, done_before=None):
+        """Does this task's verification include the heavy tier (defaults.full_verify)?
+
+        task.full_verify true/false decides; otherwise every full_verify_every-th completed task does."""
+        flag = task.get("full_verify")
+        if flag is not None:
+            return bool(flag)
+        every = int(self.d["full_verify_every"] or 0)
+        if every <= 0:
+            return False
+        if done_before is None:
+            done_before = sum(1 for s in self.state["tasks"].values() if s["status"] == "done")
+        return (done_before + 1) % every == 0
+
+    def check_list(self, task):
+        """(fast, heavy): fast commands the worker should run itself, heavy ones only the orchestrator runs."""
+        fast = list(task.get("verify", []))
+        if not task.get("skip_default_verify"):
+            fast += self.d["verify"]
+        fast = dedupe(fast)
+        heavy = [c for c in dedupe(self.d["full_verify"]) if c not in fast] if self.wants_full(task) else []
+        return fast, heavy
+
+    def _is_plan_log(self, path):
+        return path in {(self.rel / n).as_posix() for n in ("PROGRESS.md", "DECISIONS.md")}
+
+    def tree_key(self):
+        """Fingerprint of the content of the worktree (tracked + untracked, not ignored files), ignoring
+        the two logs the orchestrator itself appends to. Equal key = a passed check is still valid."""
+        self.stage()
+        entries = git(self.wt, "ls-files", "-s").splitlines()
+        keep = [e for e in entries if not self._is_plan_log(e.split("\t", 1)[-1])]
+        return hashlib.sha256("\n".join(keep).encode()).hexdigest()
+
+    def base_commit(self):
+        b = self.state.get("base_commit")
+        if b:
+            return b
+        base = self.plan.get("base_branch")
+        if base:
+            r = run(["git", "merge-base", "HEAD", base], self.wt, check=False)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        return None
+
+    def changed_files(self, base):
+        """Files added, copied, modified or renamed in the worktree relative to `base` (None if unknown)."""
+        if not base:
+            return None
+        self.stage()
+        out = git(self.wt, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR", base)
+        return [f for f in out.split("\0") if f and not self._is_plan_log(f)]
+
+    def run_verify(self, cmds, base, label):
+        """Run check commands against the current worktree. Returns (ok, message for the worker).
+
+        Applies {changed_files}, skips commands that already passed on this exact tree, and runs
+        the rest in parallel (defaults.verify_parallel / verify_fail_fast)."""
+        d = self.d
+        key = self.tree_key() if d["verify_cache"] else None
+        cache = self.state.setdefault("verify_cache", {})
+        files = self.changed_files(base) if any(CHANGED_FILES in c for c in cmds) else None
+        todo = []                                   # (shown, expanded, cache key)
+        for raw in cmds:
+            cmd, why = expand_cmd(raw, files)
+            if cmd is None:
+                self.log(f"{label}: skipped `{raw}` ({why})")
+                continue
+            ck = hashlib.sha256(f"{cmd}\0{key}".encode()).hexdigest() if key else None
+            if ck and ck in cache:
+                self.log(f"{label}: ✓ `{raw}` (cached: tree unchanged since it last passed)")
+                continue
+            todo.append((raw, cmd, ck))
+        if not todo:
+            return True, ""
+        timeout_s = d["verify_timeout_minutes"] * 60
+        mode = "in parallel" if d["verify_parallel"] and len(todo) > 1 else "sequentially"
+        self.log(f"{label}: running {len(todo)} check(s) {mode}")
+        t0 = time.time()
+        results = run_checks([c for _, c, _ in todo], self.wt, timeout_s,
+                             parallel=d["verify_parallel"], fail_fast=d["verify_fail_fast"])
+        for (raw, _, ck), r in zip(todo, results):
+            mark = {"ok": "✓", "failed": "✗", "timeout": "✗"}.get(r["state"])
+            if mark:
+                self.log(f"{label}: {mark} `{raw}` ({fmt_secs(r['secs'])})")
+            if r["state"] == "ok" and ck:
+                cache[ck] = ts()
+        while len(cache) > 500:                     # keep state.json small; oldest entries go first
+            cache.pop(next(iter(cache)))
+        if all(r["state"] == "ok" for r in results):
+            self.log(f"{label}: all checks passed in {fmt_secs(time.time() - t0)}")
+            return True, ""
+        return False, format_check_failures(results, [raw for raw, _, _ in todo], timeout_s)
+
+    def verify(self, task, start_head):
+        fast, heavy = self.check_list(task)
+        if heavy:
+            self.log(f"{task['id']}: full verification checkpoint ({len(heavy)} extra command(s))")
+        return self.run_verify(fast + heavy, start_head, task["id"])
+
+    def final_commands(self):
+        return dedupe(self.d.get("final_verify") or (list(self.d["verify"]) + list(self.d["full_verify"])))
+
+    def final_gate(self):
+        """Once every task is done: verify the finished branch as a whole. Returns True/False, or None
+        when there is nothing to run. The result is recorded in state.json and REPORT.md."""
+        cmds = self.final_commands()
+        if not cmds:
+            return None
+        self.herdr_progress("final verification")
+        self.current = "final verification"
+        self.log(f"all tasks done; running final verification ({len(cmds)} command(s))")
+        ok, out = self.run_verify(cmds, self.base_commit(), "final")
+        self.state["final_verify"] = {"ok": ok, "at": ts(), "commit": git(self.wt, "rev-parse", "--short", "HEAD"),
+                                      "output": "" if ok else out}
+        self.log("final verification " + ("passed" if ok else
+                 "FAILED; every task passed its own gate, so look for an interaction between tasks "
+                 f"(`git bisect` on {self.branch} with the failing command)"))
+        self.save()
+        return ok
 
     def review(self, task, start_head):
         self.stage()
@@ -777,10 +1050,19 @@ class Runner:
             parts.append("## Acceptance criteria\n" + "\n".join(f"- {a}" for a in task["acceptance"]))
         if task.get("context_files"):
             parts.append("## Files likely relevant\n" + "\n".join(f"- `{f}`" for f in task["context_files"]))
-        cmds = task.get("verify", []) + self.d["verify"]
-        if cmds:
-            parts.append("## Verification (the orchestrator re-runs these after you finish; all must pass)\n"
-                         + "\n".join(f"- `{c}`" for c in cmds))
+        fast, heavy = self.check_list(task)
+        if fast:
+            parts.append("## Verification (run these yourself before you finish; the orchestrator re-runs them and all must pass)\n"
+                         + "\n".join(f"- `{c}`" for c in fast))
+        if heavy:
+            parts.append("## Checked by the orchestrator only\n"
+                         "These heavy checks run after you finish, together with the ones above. You do not need to "
+                         "run them yourself unless you are chasing a failure they would catch; a failure is sent back "
+                         "to you.\n" + "\n".join(f"- `{c}`" for c in heavy))
+        if any(CHANGED_FILES in c for c in fast + heavy):
+            parts.append(f"`{CHANGED_FILES}` in a command stands for the space-separated, shell-quoted list of files "
+                         "this task added or changed (for example from `git status --porcelain`); substitute it when "
+                         "you run the command yourself. If it would be empty the orchestrator skips that command.")
         if feedback:
             parts.append("## A previous attempt at this task was rejected\n"
                          "The working tree was reset to the last good commit. Avoid repeating the problem below.\n\n"
@@ -793,7 +1075,7 @@ class Runner:
 
     def gate(self, task, start_head, entry, account):
         """Orchestrator-side checks of a worker's 'done'. Returns (ok, problem, outcome)."""
-        ok, out = self.verify(task)
+        ok, out = self.verify(task, start_head)
         if not ok:
             return False, "Verification failed:\n" + out, "verify-failed"
         if task.get("review", self.d["review"]):
@@ -948,11 +1230,21 @@ class Runner:
             print(f"Plan {self.pid}: {len(order)} tasks, worktree would be {self.wt}, branch {self.branch}")
             print(f"  fix-ups per attempt: {self.d['fixups']} (same session, +${self.d['fixup_budget_usd']:.2f} "
                   f"budget each, {self.d['fixup_timeout_minutes']} min); then reset and escalate\n")
-            for t in order:
+            d = self.d
+            print(f"  verification: {'parallel' if d['verify_parallel'] else 'sequential'}"
+                  f"{', fail-fast' if d['verify_fail_fast'] else ''}"
+                  f"{', cached on unchanged tree' if d['verify_cache'] else ''}; "
+                  f"full tier ({len(d['full_verify'])} cmd) every {d['full_verify_every'] or 'no'} task(s) "
+                  f"or where task.full_verify; final gate: {len(self.final_commands())} cmd\n")
+            for i, t in enumerate(order):
                 m, e = pick_model(t, self.d, 1)
                 m2, e2 = pick_model(t, self.d, 2)
                 deps = ",".join(t.get("depends_on", [])) or "-"
-                print(f"  {t['id']:<6} {m}/{e:<7} (retry: {m2}/{e2})  deps={deps}  {t['title']}")
+                tier = "full" if d["full_verify"] and self.wants_full(t, i) else "fast"
+                if t.get("skip_default_verify"):
+                    tier += "*"
+                print(f"  {t['id']:<6} {m}/{e:<7} (retry: {m2}/{e2})  verify={tier:<5} deps={deps}  {t['title']}")
+            print("\n  verify=fast* means defaults.verify is skipped for that task (skip_default_verify)")
             return
         version = run([*self.claude, "--version"], self.repo, check=False, extra_env=self.claude_env)
         if version.returncode != 0:
@@ -962,6 +1254,7 @@ class Runner:
             self.log(f"herdr detected (pane {self.herdr.pane}): reporting state to the sidebar")
         self.herdr_progress("preparing worktree")
         self.ensure_worktree()
+        self.state.pop("final_verify", None)    # stale once the plan is run again
         self.save()
         try:
             while True:
@@ -1001,6 +1294,13 @@ class Runner:
             self.log("interrupted; state saved, rerun the same command to resume")
             self.herdr.release()
             sys.exit(130)
+        if all(s["status"] == "done" for s in self.state["tasks"].values()):
+            try:
+                self.final_gate()
+            except KeyboardInterrupt:
+                self.log("interrupted during final verification; rerun the same command to repeat it")
+                self.herdr.release()
+                sys.exit(130)
         self.save()
         summary = self.short_summary()
         self.log(f"finished. {summary}. Report: {self.run_dir / 'REPORT.md'}")
@@ -1045,9 +1345,11 @@ class Runner:
         if not self.herdr.enabled:
             return
         c = self.counts()
+        final_failed = self.state.get("final_verify", {}).get("ok") is False
         needs_you = c.get("failed", 0) + c.get("blocked", 0)
-        if needs_you or c.get("pending", 0):
+        if needs_you or c.get("pending", 0) or final_failed:
             msg = (f"{needs_you} task(s) need you" if needs_you
+                   else "final verification failed" if final_failed
                    else f"stopped early (budget or usage limit), {c['pending']} task(s) pending")
             msg += f": see {self.rel.as_posix()}/run/REPORT.md"
             self.herdr.report("blocked", msg, resume_argv=self.resume_argv())
@@ -1071,7 +1373,17 @@ class Runner:
     # ---- reporting
     def short_summary(self):
         parts = ", ".join(f"{v} {k}" for k, v in sorted(self.counts().items()))
-        return f"autopilot {self.pid}: {parts}; ${self.state['total_cost_usd']:.2f}"
+        fv = self.state.get("final_verify")
+        final = "" if not fv else ", final verify passed" if fv["ok"] else ", final verify FAILED"
+        return f"autopilot {self.pid}: {parts}{final}; ${self.state['total_cost_usd']:.2f}"
+
+    def _final_line(self):
+        fv = self.state.get("final_verify")
+        if fv:
+            return f"{'passed' if fv['ok'] else 'FAILED'} at {fv['commit']} ({fv['at']})"
+        if not self.final_commands():
+            return "not configured"
+        return "not run yet (runs once every task is done)"
 
     def write_report(self):
         n_done = sum(1 for s in self.state["tasks"].values() if s["status"] == "done")
@@ -1083,6 +1395,7 @@ class Runner:
                  f"- Updated: {ts()}", f"- Progress: {n_done}/{len(self.plan['tasks'])} tasks done",
                  f"- Tasks done: {', '.join(done_tasks) or '-'}",
                  f"- Tasks NOT done: {', '.join(todo_tasks) or '-'}",
+                 f"- Final verification: {self._final_line()}",
                  f"- Branch: `{self.branch}`", f"- Worktree: `{self.wt}`",
                  f"- Estimated cost so far: ${self.state['total_cost_usd']:.2f}",
                  f"- Run time so far: {fmt_dur(self.state['elapsed_seconds'])} "
@@ -1100,8 +1413,15 @@ class Runner:
                          f"${s['cost_usd']:.2f} | {note} |")
         blocked = [(t, self.state["tasks"][t["id"]]) for t in self.plan["tasks"]
                    if self.state["tasks"][t["id"]]["status"] in ("blocked", "failed")]
-        if blocked:
+        fv = self.state.get("final_verify")
+        if blocked or (fv and not fv["ok"]):
             lines += ["", "## Needs you"]
+            if fv and not fv["ok"]:
+                lines.append(f"\n### Final verification failed (commit {fv['commit']})\n"
+                             "- Every task passed its own gate, so this is probably an interaction between tasks. "
+                             f"Fix it in the worktree or add a task to tasks.json, then rerun; "
+                             f"`git bisect` on `{self.branch}` with the failing command finds the task.\n"
+                             "- Output:\n\n```\n" + tail(fv.get("output", ""), 3000) + "\n```")
             for t, s in blocked:
                 lines.append(f"\n### {t['id']} — {t['title']} ({s['status']})")
                 if s.get("question"):

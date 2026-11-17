@@ -18,7 +18,7 @@ You and a strong model settle every decision up front in a `SPEC.md` and a `task
 
 **Orchestration lives in code, not in Claude.** Task order, retry counts, model escalation, and state are managed by the script and persisted in `state.json`. If a Claude session crashes or hits a usage limit, nothing is lost — re-run the same command and it resumes where it stopped.
 
-**It doesn't trust self-reports.** A worker saying "done" isn't enough. The script runs your `verify` commands (tests, typecheck, lint) and, for important tasks, a read-only Opus reviewer inspects the diff. Only if both pass does the script commit. On failure, the error is first sent back to the *same worker session* (`--resume`, so context and half-finished code are still there — cheap and fast) for one fix-up round. Only if that also fails is the worktree reset to the last good commit, the error added to the next attempt's prompt, and the model escalated.
+**It doesn't trust self-reports.** A worker saying "done" isn't enough. The script runs your `verify` commands (tests, typecheck, lint; in parallel, only on what changed, with a full-suite checkpoint and a final gate) and, for important tasks, a read-only Opus reviewer inspects the diff. Only if both pass does the script commit. On failure, the error is first sent back to the *same worker session* (`--resume`, so context and half-finished code are still there — cheap and fast) for one fix-up round. Only if that also fails is the worktree reset to the last good commit, the error added to the next attempt's prompt, and the model escalated.
 
 **Nobody asks anybody.** Workers run with `--permission-prompts none`, so they have no way to ask you questions. When something is ambiguous they pick the option that best fits the spec and log it in `DECISIONS.md`. Only when they truly can't continue (contradictory spec, missing credentials, irreversible action) do they return `blocked` with a question and a suggested answer. The script records it in the report, skips the tasks that depend on it, and keeps going with independent branches of work.
 
@@ -148,6 +148,34 @@ Override per task with `escalate_to`, or set `fixups: 0` to skip step 1.
 - **Precise limit waits** — if a usage-limit message includes a reset time ("resets at 3am", "try again in 25 minutes"), the script sleeps for exactly that long (+1 minute, max 6 hours) instead of a fixed delay. After `max_limit_waits` it stops the run and leaves the task pending rather than burning an attempt and escalating to Opus for a non-code reason.
 - **Per-task timing** — the report and `autopilot status --sessions` show duration and fix-up rounds per task, so you can tune models in the next plan.
 
+### Fast verification without losing the safety net
+
+Every task is gated by `defaults.verify` plus its own `task.verify`. Running the whole suite after every task is the slowest part of a run, so verification is tiered:
+
+| Tier | Config | Runs |
+|---|---|---|
+| fast | `defaults.verify`, `task.verify` | after every task (lint, typecheck, tests for the changed files) |
+| full | `defaults.full_verify` | on tasks with `"full_verify": true`, after every Nth task (`full_verify_every`), and in the final gate |
+| final | `defaults.final_verify` (default: `verify` + `full_verify`) | once, when every task is done |
+
+- **Parallel.** The commands of one verification run concurrently (`verify_parallel`, default `true`), so the wall time is the slowest command, not the sum. By default the first failure kills the rest (`verify_fail_fast`, default `true`); set it to `false` to collect every failure in one message. Set `verify_parallel` to `false` if your commands share state (the same build directory or test database).
+- **Changed files only.** `{changed_files}` in any verify command expands to the shell-quoted files the task added, modified or renamed, e.g. `npx vitest related --run {changed_files}`, `jest --findRelatedTests {changed_files}`, `eslint {changed_files}`. If nothing changed the command is skipped (logged). In the final gate it covers the whole branch.
+- **Skip defaults for a task.** `"skip_default_verify": true` runs only that task's own `verify` (docs, read-only review tasks). `"full_verify": false` keeps a task out of the checkpoints; `true` forces the full tier.
+- **Cache.** A command that passed on a content-identical tree is not run again (`verify_cache`, default `true`): retries that reproduce the same tree, a fix-up round that changes nothing, or the final gate right after a task that already ran the same command. The key is the content of tracked and untracked files (not ignored files) plus the exact command; `PROGRESS.md` and `DECISIONS.md` are left out. Turn it off if a check depends on state outside the repo (database, network, clock).
+- **Final gate.** When every task is done the whole branch is verified once more and the result goes into `REPORT.md`. This is what makes a light fast tier safe: a regression that slipped past targeted tests is caught here, and every task is its own commit, so `git bisect` finds the culprit.
+- **No duplicate runs.** The worker runs only the fast tier itself; the full tier is left to the orchestrator and a failure is sent back to the same session.
+- **Incremental tools.** Workers share one worktree and `git clean` does not remove ignored files, so caches such as `tsc --incremental`, `eslint --cache` and the vitest/jest caches survive between tasks.
+
+```json
+"defaults": {
+  "verify": ["npm run typecheck", "npm run lint", "npx vitest related --run {changed_files}"],
+  "full_verify": ["npm test -- --run", "npm run build"],
+  "full_verify_every": 4
+}
+```
+
+Trade-off: with a light fast tier a regression in a distant module shows up at the next checkpoint or the final gate instead of right away, where the worker no longer has the context. Give tasks that touch shared code (schema, types, config) `"full_verify": true`.
+
 ## Running with herdr
 
 When `autopilot run` executes inside a herdr pane (`HERDR_ENV=1`), it automatically does the following — no configuration needed:
@@ -164,7 +192,11 @@ When `autopilot run` executes inside a herdr pane (`HERDR_ENV=1`), it automatica
 
 | Field | Meaning |
 |---|---|
-| `defaults.verify` | Command(s) run after every task (typecheck, lint, test). Non-zero exit = fail. |
+| `defaults.verify` | Fast checks run after every task (typecheck, lint, targeted tests); may use `{changed_files}`. Non-zero exit = fail. |
+| `defaults.full_verify` / `full_verify_every` | Heavy checks (full suite, build) run on tasks with `full_verify: true`, after every Nth task (`0` = off), and in the final gate. See [Fast verification](#fast-verification-without-losing-the-safety-net). |
+| `defaults.final_verify` | Commands run once when every task is done. Default: `verify` + `full_verify`. |
+| `defaults.verify_parallel` / `verify_fail_fast` / `verify_cache` | Run commands concurrently (default `true`), cancel the rest on the first failure (`true`), skip commands that already passed on an identical tree (`true`). |
+| `defaults.verify_timeout_minutes` | Timeout per verify command (default 30). |
 | `defaults.setup` | Run once when the worktree is created, e.g. copy `.env` and `npm ci`. |
 | `defaults.permission_mode` | Default `auto` (a classifier vets each action). See [Safety](#safety). |
 | `defaults.max_model` / `max_effort` | Hard ceiling for every session (workers, fix-ups, reviewer, escalation). Defaults: `claude-opus-5-5` / `xhigh`; anything higher is clamped down. |
@@ -176,6 +208,8 @@ When `autopilot run` executes inside a herdr pane (`HERDR_ENV=1`), it automatica
 | `defaults.stream` | Default `true`: use `stream-json` for the live view. Set `false` to fall back to `--output-format json` if your Claude Code version has stream issues. |
 | `task.depends_on` | Task ids this task depends on. If a dependency fails or is blocked, this task is skipped; other branches continue. |
 | `task.verify` | Task-specific checks, run in addition to `defaults.verify`. |
+| `task.skip_default_verify` | `true`: run only `task.verify`, not `defaults.verify` (docs and read-only tasks). |
+| `task.full_verify` | `true` forces the full tier for this task; `false` keeps it out of the `full_verify_every` checkpoints. |
 | `task.review` | If `true`, a read-only reviewer session (default Opus/high) must approve the diff. |
 | `task.escalate_to` | `{ "model": ..., "effort": ... }` used from the second attempt on. |
 | `task.context_files` | Files the worker should look at first, saving exploration context. |

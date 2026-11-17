@@ -37,6 +37,7 @@ Split the work into tasks a fresh session can finish and verify on its own:
 
 - One coherent change per task, typically touching no more than about 10 files, and small enough to finish well inside one context window. Prefer more small tasks over a few large ones.
 - Each task must be **independently verifiable** by commands that exit non-zero on failure. Add task-specific test commands (for example a single test file) on top of the plan-wide `defaults.verify`.
+- Keep verification fast, because it runs after every task. Put only cheap checks in `defaults.verify` (typecheck, lint, and tests of the changed files via `{changed_files}`, such as `vitest related --run {changed_files}` or `jest --findRelatedTests {changed_files}`). Put the full suite and the build in `defaults.full_verify`, set `full_verify_every` (3–5), and mark tasks that touch shared code (schema, types, config) and the integration task with `"full_verify": true`. Give docs and read-only review tasks `"skip_default_verify": true`. `final_verify` (default `verify` + `full_verify`) runs once after the last task. Never leave a plan with `{changed_files}` and no full-suite command anywhere; `autopilot validate` warns about it.
 - Each task's `instructions` must stand alone: say what to build, which spec sections and decisions apply (by number), and which existing code to imitate. Never write "as discussed".
 - Order by dependency: foundations (types, schema, interfaces) first, then features, then integration. Use `depends_on` so a failure skips only the work that truly depends on it.
 - Put tests in the same task as the code they test, or immediately before it.
@@ -68,7 +69,9 @@ Set `review: true` on tasks where a wrong-but-green result would be costly (auth
     "max_budget_usd": 8,
     "timeout_minutes": 90,
     "setup": ["cp ../myrepo/.env .env", "npm ci"],
-    "verify": ["npm run typecheck", "npm run lint", "npm test -- --run"],
+    "verify": ["npm run typecheck", "npm run lint", "npx vitest related --run {changed_files}"],
+    "full_verify": ["npm test -- --run", "npm run build"],
+    "full_verify_every": 3,
     "review": false,
     "reviewer": { "model": "claude-opus-5-5", "effort": "high" },
     "permission_mode": "auto"
