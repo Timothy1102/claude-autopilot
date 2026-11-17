@@ -546,14 +546,17 @@ def describe_event(ev: dict, show_tools: bool = False):
     return out
 
 
-def wrap_live(msg: str, prefix: str = "   │ ", max_lines: int = 4):
-    """Wrap one live-view message to the terminal width; continuation lines align under the text."""
-    width = max(50, shutil.get_terminal_size((110, 24)).columns - len(prefix) - 1)
+def wrap_live(msg: str, prefix: str = "   │ ", max_lines: int = 4, stamp: bool = True):
+    """Wrap one live-view message to the terminal width; continuation lines align under the text.
+    With `stamp`, the first line starts with the current time (HH:MM:SS) in place of the leading indent."""
+    first = f"{dt.datetime.now():%H:%M:%S} │ " if stamp else prefix
+    pad = " " * (len(first) - 2) + "│ " if stamp else prefix
+    width = max(50, shutil.get_terminal_size((110, 24)).columns - len(first) - 1)
     lines = textwrap.wrap(msg, width=width, subsequent_indent="   ", break_long_words=True) or [msg]
     if len(lines) > max_lines:
         lines = lines[:max_lines]
         lines[-1] = lines[-1][:width - 1].rstrip() + "…"
-    return [prefix + ln for ln in lines]
+    return [(first if i == 0 else pad) + ln for i, ln in enumerate(lines)]
 
 
 class Herdr:
