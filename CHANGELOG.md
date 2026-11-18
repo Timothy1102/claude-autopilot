@@ -3,6 +3,7 @@
 Versioning follows [SemVer](https://semver.org). The version lives in `__version__` in `autopilot.py`.
 
 ## Unreleased
+- Project polish: logo and illustrations (`assets/`), README restructure with detailed guides in `docs/`, contributing / security / conduct docs, issue and PR templates, CI (tests on Python 3.9–3.13, ruff, shellcheck), smoke tests, and a runnable `examples/SPEC.md`.
 - Graceful stop: press `q` during `autopilot run` to stop once the running task is finished (state saved, rerun to resume); Ctrl+C still stops immediately. A dimmed help line stays pinned on the bottom row of the terminal (scroll region), two blank rows below the log.
 - Environment health checks (`defaults.healthcheck`): checked before every attempt, when verification fails and when a worker reports `blocked`. A down environment pauses the run instead of failing the task and escalating; a failed verification is re-run once it is back, a worker blocked by the outage gets the task back in its own session, and if it never recovers the run stops with the attempt not counted.
 - Flaky checks: a failed check is re-run alone before the work is rejected (`verify_flaky_retries`, default 1); a pass on the re-run is accepted, listed in REPORT.md and not cached. `verify_max_parallel` caps concurrent checks.

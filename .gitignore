@@ -15,3 +15,7 @@ build
 .env.production
 __pycache__/
 *.pyc
+
+.autopilot/
+*.log
+.ruff_cache/

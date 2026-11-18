@@ -1,0 +1,44 @@
+name: Bug report
+description: Something in autopilot didn't work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you run, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: "`run/REPORT.md`, `run/live.log` or the terminal output. Remove secrets and private code first."
+      render: text
+  - type: input
+    id: autopilot
+    attributes:
+      label: autopilot version
+      description: Output of `autopilot --version`
+    validations:
+      required: true
+  - type: input
+    id: claude
+    attributes:
+      label: Claude Code version
+      description: Output of `claude --version`
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS and Python version
+      placeholder: macOS 15, Python 3.12
+    validations:
+      required: true
+  - type: textarea
+    id: plan
+    attributes:
+      label: tasks.json (optional)
+      description: A minimal plan that reproduces the problem, with private details removed.
+      render: json

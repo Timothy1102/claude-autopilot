@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 400" width="860" height="400" role="img" aria-label="Illustration of the autopilot live view">
+  <title>autopilot live view (illustration)</title>
+  <rect width="860" height="400" rx="12" fill="#0F172A"/>
+  <path d="M0 12a12 12 0 0 1 12-12h836a12 12 0 0 1 12 12v24H0z" fill="#1E293B"/>
+  <circle cx="22" cy="18" r="6" fill="#F87171"/><circle cx="42" cy="18" r="6" fill="#FBBF24"/><circle cx="62" cy="18" r="6" fill="#34D399"/>
+  <text x="430" y="23" text-anchor="middle" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#94A3B8">autopilot run .autopilot/billing-v2/tasks.json</text>
+  <g font-family="'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13.5" fill="#CBD5E1" xml:space="preserve">
+    <text x="22" y="68"  fill="#64748B">02:14:07 </text><text x="92" y="68">T01: ▶ attempt 1 · sonnet-5-5/high</text>
+    <text x="22" y="92"  fill="#64748B">02:14:31 </text><text x="92" y="92" fill="#E8A88F">💭 The spec says integer cents (D2) — I'll mirror the newest migration…</text>
+    <text x="22" y="116" fill="#64748B">02:21:48 </text><text x="92" y="116">T01: 🔍 verification started: 3 check(s) in parallel</text>
+    <text x="22" y="140" fill="#64748B">02:22:30 </text><text x="92" y="140">T01: 🔍 verification passed in 42s</text>
+    <text x="22" y="164" fill="#64748B">02:22:31 </text><text x="92" y="164">T01: 🧐 review started (opus-5-5/high)</text>
+    <text x="22" y="188" fill="#64748B">02:25:02 </text><text x="92" y="188">T01: 🧐 review approved</text>
+    <text x="22" y="212" fill="#64748B">02:25:03 </text><text x="92" y="212" fill="#34D399" font-weight="bold">✅ T01: DONE (a3f9c21, $1.84, 11m)</text>
+    <text x="22" y="236" fill="#64748B">02:25:05 </text><text x="92" y="236">T02: ▶ attempt 1 · haiku-5-5/medium</text>
+    <text x="22" y="260" fill="#64748B">02:31:12 </text><text x="92" y="260">T02: 🔍 verification FAILED in 18s (1 failing check(s))</text>
+    <text x="22" y="284" fill="#64748B">02:31:13 </text><text x="92" y="284" fill="#FBBF24">T02: fix-up round 1/2 — resuming the same session</text>
+    <text x="22" y="308" fill="#64748B">02:34:40 </text><text x="92" y="308">T02: 🔍 verification passed in 20s</text>
+    <text x="22" y="332" fill="#64748B">02:34:41 </text><text x="92" y="332" fill="#34D399" font-weight="bold">✅ T02: DONE (7be01d4, $0.21, 9m)</text>
+  </g>
+  <text x="430" y="382" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" fill="#475569">illustrative output — press q to stop after the running task</text>
+</svg>

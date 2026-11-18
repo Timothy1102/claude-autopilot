@@ -1,8 +1,31 @@
-# claude-autopilot
+<div align="center">
 
-Run a large task with [Claude Code](https://claude.com/claude-code) from start to finish, unattended — for example overnight.
+<img src="assets/banner.svg" alt="claude-autopilot" width="520">
+
+<p>
+  <a href="https://github.com/Timothy1102/claude-autopilot/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Timothy1102/claude-autopilot/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/version-0.1.0-D97757"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-34D399"></a>
+  <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white">
+  <img alt="Dependencies: none" src="https://img.shields.io/badge/dependencies-none-lightgrey">
+  <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen"></a>
+</p>
+
+**Plan a big task with Claude Code once. Let it run overnight. Wake up to verified commits and a report.**
+
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Commands](#commands) · [Configuration](docs/configuration.md) · [Safety](#safety) · [Contributing](CONTRIBUTING.md)
+
+</div>
+
+---
+
+`claude-autopilot` runs a large task with [Claude Code](https://claude.com/claude-code) from start to finish, unattended.
 
 You and a strong model settle every decision up front in a `SPEC.md` and a `tasks.json`. After that, a Python script runs each task in its own fresh `claude -p` session (clean context, its own model and effort level), verifies the result, commits it, retries on failure, and leaves a report for the morning.
+
+<div align="center">
+<img src="assets/demo.svg" alt="Illustration of the autopilot live view: tasks run, verify, get reviewed and committed" width="760">
+</div>
 
 ```
  You + Opus (interactive)            autopilot (unattended)                 You (next morning)
@@ -14,23 +37,27 @@ You and a strong model settle every decision up front in a `SPEC.md` and a `task
 └──────────────────────────┘      └──────────────────────────────┘      └─────────────────────┘
 ```
 
-## Why it works overnight
+## Features
 
-**Orchestration lives in code, not in Claude.** Task order, retry counts, model escalation, and state are managed by the script and persisted in `state.json`. If a Claude session crashes or hits a usage limit, nothing is lost — re-run the same command and it resumes where it stopped.
-
-**It doesn't trust self-reports.** A worker saying "done" isn't enough. The script runs your `verify` commands (tests, typecheck, lint; in parallel, only on what changed, with a full-suite checkpoint and a final gate) and, for important tasks, a read-only Opus reviewer inspects the diff. Only if both pass does the script commit. On failure, the error is first sent back to the *same worker session* (`--resume`, so context and half-finished code are still there — cheap and fast) for one fix-up round. Only if that also fails is the worktree reset to the last good commit, the error added to the next attempt's prompt, and the model escalated.
-
-**Nobody asks anybody.** Workers run with `--permission-prompts none`, so they have no way to ask you questions. When something is ambiguous they pick the option that best fits the spec and log it in `DECISIONS.md`. Only when they truly can't continue (contradictory spec, missing credentials, irreversible action) do they return `blocked` with a question and a suggested answer. The script records it in the report, skips the tasks that depend on it, and keeps going with independent branches of work.
+- **Orchestration in code, not in Claude.** Task order, retries, model escalation and state live in the script and in `state.json`. Crash, usage limit, closed laptop: re-run the same command and it resumes.
+- **Doesn't trust self-reports.** Your `verify` commands (tests, typecheck, lint) run in parallel on what changed, with a full-suite checkpoint and a final gate. Important tasks also get a read-only Opus reviewer. Only then does the script commit.
+- **Cheap failures first.** A failed check goes back to the *same* worker session for a fix-up round; only if that fails is the tree reset and the model escalated (Haiku → Sonnet → Opus).
+- **Nobody asks anybody.** Workers can't prompt you. They pick the option that best fits the spec and log it in `DECISIONS.md`; a truly blocking question is recorded in the report while independent work continues.
+- **Isolated and reviewable.** Runs in its own git worktree and branch (`autopilot/<plan-id>`), one commit per task. Your checkout is untouched.
+- **Built for long runs.** Usage-limit waits with exact reset times, multi-account fallback, environment health checks, cost caps, a live view and a morning report.
+- **Zero dependencies.** One Python file, standard library only.
 
 ## Requirements
 
 - [Claude Code](https://claude.com/claude-code) **v2.1.259 or newer** (needs the `--permission-prompts` flag)
-- Python 3.9+ (standard library only — no pip install)
+- Python 3.9+ (standard library only, no `pip install`)
 - git
 - macOS, Linux, or WSL
-- Optional but recommended for overnight runs: [herdr](https://herdr.dev) (terminal workspace manager — see [Running with herdr](#running-with-herdr))
+- Optional: [herdr](https://herdr.dev) for detached overnight runs (see [docs/herdr.md](docs/herdr.md))
 
-## Installation
+## Quick start
+
+### Install
 
 One install works for every repo:
 
@@ -39,23 +66,7 @@ git clone https://github.com/Timothy1102/claude-autopilot ~/.claude-autopilot
 ~/.claude-autopilot/install.sh
 ```
 
-This creates the `autopilot` command in `~/.local/bin` and installs the `/autopilot-plan` skill into `~/.claude/skills/`. Make sure `~/.local/bin` is on your `PATH`.
-
-Optional herdr setup:
-
-```bash
-brew install herdr                     # or: curl -fsSL https://herdr.dev/install.sh | sh
-herdr integration install claude       # shows the planning session's status in herdr
-```
-
-herdr doesn't show popup notifications by default. To get one when a run finishes, add this to `~/.config/herdr/config.toml` and run `herdr server reload-config`:
-
-```toml
-[ui.toast]
-delivery = "system"   # or "herdr" for in-app toasts
-```
-
-## Usage
+This creates the `autopilot` command in `~/.local/bin` and installs the `/autopilot-plan` skill into `~/.claude/skills/`. Make sure `~/.local/bin` is on your `PATH`. Verify with `autopilot --version`.
 
 ### 1. Plan (you're present, ~20–60 minutes)
 
@@ -67,30 +78,25 @@ claude --model claude-opus-5-5 --effort xhigh
 > /autopilot-plan Rewrite the billing module to be invoice-based, ...
 ```
 
-The skill reads the codebase, runs the tests to confirm the baseline is green, then asks you about each group of decisions (always with a recommended option). It then writes `.autopilot/<plan-id>/SPEC.md` and `tasks.json`, assigns a model and effort level to every task, and runs `autopilot validate` plus `--dry-run` so you can see the result.
+The skill reads the codebase, runs the tests to confirm the baseline is green, then asks you about each group of decisions (always with a recommended option). It writes `.autopilot/<plan-id>/SPEC.md` and `tasks.json`, assigns a model and effort level to every task, and runs `autopilot validate` plus `--dry-run` so you can see the result.
 
 This is the only step that needs you. The time you spend here determines the quality of the whole run.
 
 ### 2. Run (you go to sleep)
 
-At the end of planning the skill prints the command to launch (and offers to run it for you):
-
-```bash
-autopilot herdr .autopilot/billing-v2/tasks.json --max-total-usd 60
-```
-
-This creates a herdr workspace named `autopilot billing-v2`, starts `autopilot run` inside it, and returns immediately. You can close the terminal, shut the laptop, or lose your SSH connection — the run lives on in the herdr server. Without herdr, run it directly (ideally inside `tmux`/`screen`):
+At the end of planning the skill prints the launch command (and offers to run it):
 
 ```bash
 autopilot run .autopilot/billing-v2/tasks.json --max-total-usd 60
 ```
 
-The script creates a dedicated git worktree at `../<repo>.autopilot-<plan-id>` on branch `autopilot/<plan-id>`, so your main checkout is untouched and you can keep working. Every successful task becomes one commit, titled `<plan-id>(<task-id>): <task title>`.
+Run it inside `tmux`/`screen`, or use [herdr](docs/herdr.md) (`autopilot herdr …`) so the run outlives your terminal.
+
+The script creates a dedicated git worktree at `../<repo>.autopilot-<plan-id>` on branch `autopilot/<plan-id>`. Every successful task becomes one commit, titled `<plan-id>(<task-id>): <task title>`. Press `q` to stop gracefully after the running task; Ctrl+C stops immediately. Either way, re-running the same command resumes.
 
 ### 3. Review (next morning)
 
-- Check the herdr sidebar: the workspace shows **done** if every task finished, or **blocked** if something needs you.
-- Read `.autopilot/<plan-id>/run/REPORT.md` — a status table, costs, and a "Needs you" section listing open questions and last errors.
+- Read `.autopilot/<plan-id>/run/REPORT.md`: status table, costs, and a "Needs you" section with open questions and last errors.
 - Review the work with `git log` and `git diff main...autopilot/<plan-id>`.
 - If there are open questions, add the decisions to `SPEC.md` (or edit `tasks.json`) in your main checkout, then resume:
 
@@ -99,6 +105,29 @@ autopilot run .autopilot/billing-v2/tasks.json --retry-failed
 ```
 
 When you're happy, merge the branch or open a PR.
+
+Want to try the CLI without spending anything? Copy [`examples/`](examples/) into a git repo and run `autopilot validate examples/tasks.example.json` and `autopilot run examples/tasks.example.json --dry-run`.
+
+## How it works
+
+**Orchestration lives in code, not in Claude.** If a session crashes or hits a usage limit, nothing is lost: state is persisted in `state.json` and the same command picks up where it stopped.
+
+**It doesn't trust self-reports.** A worker saying "done" isn't enough. The script runs your `verify` commands and, for important tasks, a read-only reviewer inspects the diff. Only if both pass does it commit. On failure the error is sent back to the same worker session (`--resume`, so context and half-finished code are still there) for up to two fix-up rounds. Only if those fail is the worktree reset to the last good commit, the error added to the next attempt's prompt, and the model escalated.
+
+**Nobody asks anybody.** Workers run with `--permission-prompts none`. When something is ambiguous they choose the option that best fits the spec and log it in `DECISIONS.md`. Only when they can't continue (contradictory spec, missing credentials, irreversible action) do they return `blocked` with a question and a suggested answer. The script records it, skips dependent tasks and keeps going with independent branches.
+
+### Model and effort selection
+
+During planning, the strong model assigns a `model` and `effort` to each task. Pick the cheapest setting likely to succeed; failures escalate automatically.
+
+| Kind of work | Suggested setting |
+|---|---|
+| Mechanical, fully specified changes | Haiku |
+| Ordinary features | Sonnet / medium |
+| Hard multi-file logic | Sonnet / high |
+| Architecture, migrations, concurrency, security, integration, final review | Opus / high |
+
+More detail, including the cost and time savers and verification tiers, is in [docs/configuration.md](docs/configuration.md).
 
 ## Commands
 
@@ -120,132 +149,36 @@ Options for `run` / `herdr`:
 | `--notify-cmd "..."` | Shell command that receives a one-line summary on stdin when the run ends |
 | `--force-clean` | Discard uncommitted changes in the worktree |
 | `--no-hold` | Inside herdr, exit when done instead of waiting for Enter |
-| `--claude-bin CMD` (alias `--claude`) | `claude` command for the workers. Default `claude` (or `$AUTOPILOT_CLAUDE`). Accepts a binary path, a shell alias such as `claude-personal` (resolved via your interactive shell), or `"CLAUDE_CONFIG_DIR=~/.claude-x claude"`. Comma-separate several accounts (`claude,claude-personal`) to switch to the next one when the current one hits its usage limit, instead of sleeping |
+| `--claude-bin CMD` (alias `--claude`) | `claude` command for the workers. Default `claude` (or `$AUTOPILOT_CLAUDE`). Accepts a binary path, a shell alias such as `claude-personal`, or `"CLAUDE_CONFIG_DIR=~/.claude-x claude"`. Comma-separate several accounts to switch to the next one when the current one hits its usage limit, instead of sleeping |
 
-## Model and effort selection
+## Documentation
 
-During planning, the strong model assigns a `model` and `effort` to each task:
-
-| Kind of work | Suggested setting |
+| Doc | Contents |
 |---|---|
-| Mechanical, fully specified changes | Haiku |
-| Ordinary features | Sonnet / medium |
-| Hard multi-file logic | Sonnet / high |
-| Architecture, migrations, concurrency, security, integration, final review | Opus / high |
-
-The rule is to pick the cheapest setting likely to succeed, because failures escalate automatically in two steps:
-
-1. **Fix-up round.** Verify errors, reviewer feedback, or commit-hook failures are sent back to the same worker session, same model, with a small extra budget (`fixup_budget_usd`). That session already has the context and the half-done code, so it usually fixes things in minutes.
-2. **Escalation.** Only if the fix-up fails: reset the worktree and retry with the next model (Haiku → Sonnet → Opus, effort at least `high`); if already on Opus, raise the effort.
-
-Override per task with `escalate_to`, or set `fixups: 0` to skip step 1.
-
-### Built-in time and cost savers
-
-- **Fix-up before escalation** — a Sonnet task that fails a single test isn't thrown away and redone on Opus.
-- **Spec inlined in the prompt** — if `SPEC.md` is under `inline_spec_kb` (default 48 KB), the worker gets it, plus the tail of `PROGRESS.md` and `DECISIONS.md`, directly in the task message, saving several file-read tool calls per task.
-- **Bounded review diffs** — the diff pasted to the reviewer is truncated at `review_inline_diff_kb` (default 120 KB); the reviewer fetches the rest per file with `git diff`.
-- **Account fallback** — with `--claude-bin claude,claude-personal` a usage limit on one account moves the work to the next free account instead of sleeping. A session can only be resumed on the account that created it, so the other account starts a new session that is told the partial work is in the tree (or, for a fix-up round, gets the task plus the rejection to fix). Sleeping happens only when every account is limited.
-- **Environment health checks** — `defaults.healthcheck` (e.g. `pg_isready …`, `docker info`) runs before every attempt, when verification fails and when a worker reports `blocked`. While it fails the run waits (`healthcheck_wait_minutes`, up to `max_health_waits`) instead of failing the task and escalating to a stronger model for a reason that has nothing to do with the code; a failed verification is re-run once the environment is back, and a worker that was blocked by the outage gets the task back in its own session. If it never recovers the run stops with the task still pending and the attempt not counted, and REPORT.md says the environment is down. Workers are told to return `blocked` at once on an outage instead of spending an hour debugging Docker.
-- **SPEC in the system prompt** — when `SPEC.md` is inlined it goes into the worker's system prompt (`run/worker-rules.md`) rather than the task message. It is the same for every task, so later sessions read it from the prompt cache instead of writing it again; only the task, PROGRESS.md and DECISIONS.md differ per task.
-- **Context files inlined** — the current contents of `task.context_files` (files, not directories) are pasted into the task message up to `inline_context_kb` (default 24 KB), saving the worker's first read round-trips.
-- **Retries see the rejected diff** — when an attempt is rejected and the tree is reset, its diff (up to `retry_diff_kb`, default 40 KB; the full diff is saved in `run/logs/<task>-a<n>.diff`) goes into the next attempt's prompt as a reference, so the stronger model reuses the good parts instead of rediscovering them.
-- **No idle polling** — workers may not use `ScheduleWakeup`/`CronCreate`, and get `BASH_MAX_TIMEOUT_MS` equal to `verify_timeout_minutes`, so they run checks in the foreground instead of starting them in the background and polling with `sleep`.
-- **Precise limit waits** — if a usage-limit message includes a reset time ("resets at 3am", "try again in 25 minutes"), the script sleeps for exactly that long (+1 minute, max 6 hours) instead of a fixed delay. After `max_limit_waits` it stops the run and leaves the task pending rather than burning an attempt and escalating to Opus for a non-code reason.
-- **Per-task timing** — the report and `autopilot status --sessions` show duration and fix-up rounds per task, so you can tune models in the next plan.
-
-### Fast verification without losing the safety net
-
-Every task is gated by `defaults.verify` plus its own `task.verify`. Running the whole suite after every task is the slowest part of a run, so verification is tiered:
-
-| Tier | Config | Runs |
-|---|---|---|
-| fast | `defaults.verify`, `task.verify` | after every task (lint, typecheck, tests for the changed files) |
-| full | `defaults.full_verify` | on tasks with `"full_verify": true`, after every Nth task (`full_verify_every`), and in the final gate |
-| final | `defaults.final_verify` (default: `verify` + `full_verify`) | once, when every task is done |
-
-- **Parallel.** The commands of one verification run concurrently (`verify_parallel`, default `true`), so the wall time is the slowest command, not the sum. By default the first failure kills the rest (`verify_fail_fast`, default `true`); set it to `false` to collect every failure in one message. Set `verify_parallel` to `false` if your commands share state (the same build directory or test database).
-- **Changed files only.** `{changed_files}` in any verify command expands to the shell-quoted files the task added, modified or renamed, e.g. `npx vitest related --run {changed_files}`, `jest --findRelatedTests {changed_files}`, `eslint {changed_files}`. If nothing changed the command is skipped (logged). In the final gate it covers the whole branch.
-- **Skip defaults for a task.** `"skip_default_verify": true` runs only that task's own `verify` (docs, read-only review tasks). `"full_verify": false` keeps a task out of the checkpoints; `true` forces the full tier.
-- **Cache.** A command that passed on a content-identical tree is not run again (`verify_cache`, default `true`): retries that reproduce the same tree, a fix-up round that changes nothing, or the final gate right after a task that already ran the same command. The key is the content of tracked and untracked files (not ignored files) plus the exact command; `PROGRESS.md` and `DECISIONS.md` are left out. Turn it off if a check depends on state outside the repo (database, network, clock).
-- **Flaky checks.** A failed check is re-run alone, one at a time, before the work is rejected (`verify_flaky_retries`, default 1). Parallel suites can push the machine so hard that timing-sensitive tests time out; without this the worker gets a fix-up round, or the task is redone on a stronger model, for nothing. A check that fails and then passes alone is accepted, listed under "Flaky checks" in REPORT.md, and not cached (the final gate runs it again). Timeouts are not re-run. `verify_max_parallel` caps how many checks run at once when each one saturates the CPU.
-- **Final gate.** When every task is done the whole branch is verified once more and the result goes into `REPORT.md`. This is what makes a light fast tier safe: a regression that slipped past targeted tests is caught here, and every task is its own commit, so `git bisect` finds the culprit.
-- **No duplicate runs.** The worker runs only the fast tier itself; the full tier is left to the orchestrator and a failure is sent back to the same session.
-- **Incremental tools.** Workers share one worktree and `git clean` does not remove ignored files, so caches such as `tsc --incremental`, `eslint --cache` and the vitest/jest caches survive between tasks.
-
-```json
-"defaults": {
-  "verify": ["npm run typecheck", "npm run lint", "npx vitest related --run {changed_files}"],
-  "full_verify": ["npm test -- --run", "npm run build"],
-  "full_verify_every": 4
-}
-```
-
-Trade-off: with a light fast tier a regression in a distant module shows up at the next checkpoint or the final gate instead of right away, where the worker no longer has the context. Give tasks that touch shared code (schema, types, config) `"full_verify": true`.
-
-## Running with herdr
-
-When `autopilot run` executes inside a herdr pane (`HERDR_ENV=1`), it automatically does the following — no configuration needed:
-
-- **Sidebar status.** The pane is `working` with a description like "T03 Invoice service · attempt 2 · sonnet-5-5/high", and the pane title shows progress ("3/7 done · $4.20"). At the end it switches to `done`, or `blocked` if any task failed or has an open question; herdr plays the matching sound and notification. You can also wait on it from a script: `herdr agent wait <pane-id> --until idle --until blocked`.
-- **Live view.** Each worker runs with `--output-format stream-json`, so the pane shows what the worker is thinking as it happens (💭 reasoning, 💬 commentary, ↳ subagents), without the raw tool calls, plus clear markers for each step: 🔍 verification started/passed/FAILED, 🧐 review, ✅ task done. Set `defaults.stream_tools` to also see every tool call (🔧). The same lines are written to `run/live.log`. For a quick peek without opening the UI: `herdr pane read <pane-id> --source recent --lines 40`.
-- **Auto-resume.** Autopilot registers its own resume command with herdr. After a herdr server restart, herdr reopens the pane and re-runs `autopilot run …`; `state.json` lets it continue from the interrupted task, and uncommitted changes from the interrupted attempt are discarded. Note that old processes don't survive a restart, and if the machine itself reboots you need to start herdr (`herdr` or `herdr server`) again.
-- **Pane stays open** at the end so the done/blocked state is still visible when you return. Use `--no-hold` to exit immediately.
-- **No hook interference.** If you've run `herdr integration install claude`, that hook fires in every Claude Code session. Autopilot strips `HERDR_*` variables from the worker environment so `claude -p` sessions don't overwrite the pane state.
-
-**Remote machines.** For a dev box or server over SSH, install herdr and this kit there, connect with `herdr --remote <machine>`, and run `autopilot herdr …` on it. From your laptop, check status with `herdr --machine <name> agent list`.
-
-## tasks.json reference
-
-| Field | Meaning |
-|---|---|
-| `defaults.verify` | Fast checks run after every task (typecheck, lint, targeted tests); may use `{changed_files}`. Non-zero exit = fail. |
-| `defaults.full_verify` / `full_verify_every` | Heavy checks (full suite, build) run on tasks with `full_verify: true`, after every Nth task (`0` = off), and in the final gate. See [Fast verification](#fast-verification-without-losing-the-safety-net). |
-| `defaults.final_verify` | Commands run once when every task is done. Default: `verify` + `full_verify`. |
-| `defaults.verify_parallel` / `verify_fail_fast` / `verify_cache` | Run commands concurrently (default `true`), cancel the rest on the first failure (`true`), skip commands that already passed on an identical tree (`true`). |
-| `defaults.verify_timeout_minutes` | Timeout per verify command (default 30). Also the worker's Bash timeout cap (`BASH_MAX_TIMEOUT_MS`). |
-| `defaults.verify_max_parallel` / `verify_flaky_retries` | Cap on concurrently running checks (default `0` = all, at most 8); how many times failed checks are re-run alone before the work is rejected (default 1, `0` = off). |
-| `defaults.healthcheck` | Commands that prove the environment is up (database, Docker, services); all must exit 0. Checked before every attempt, on verification failures and on `blocked`. See [Built-in time and cost savers](#built-in-time-and-cost-savers). |
-| `defaults.healthcheck_timeout_seconds` / `healthcheck_wait_minutes` / `max_health_waits` | Per-command timeout (60 s); pause between checks while it is down (5 min); waits before the run stops (12). |
-| `defaults.setup` | Run once when the worktree is created, e.g. copy `.env` and `npm ci`. |
-| `defaults.permission_mode` | Default `auto` (a classifier vets each action). See [Safety](#safety). |
-| `defaults.max_model` / `max_effort` | Hard ceiling for every session (workers, fix-ups, reviewer, escalation). Defaults: `claude-opus-5-5` / `xhigh`; anything higher is clamped down. |
-| `defaults.max_budget_usd` | Cost ceiling per worker session, passed as `--max-budget-usd`. |
-| `defaults.limit_wait_minutes` / `max_limit_waits` | On a usage limit, sleep then `--resume` the same session. If the message includes a reset time the script sleeps exactly that long; `limit_wait_minutes` is only the fallback. After `max_limit_waits` the run stops and the task stays pending. |
-| `defaults.fixups` / `fixup_budget_usd` / `fixup_timeout_minutes` | Fix-up rounds in the same worker session before reset and escalation (default 2, extra $4 and 30 min per round). `task.fixups` overrides per task; `0` disables. |
-| `defaults.inline_spec_kb` | Inline `SPEC.md` (and the tail of PROGRESS/DECISIONS) in the prompt when the spec is at most this size (default 48). `0` makes the worker always read files itself. |
-| `defaults.inline_context_kb` | Paste the current contents of `task.context_files` into the prompt up to this total (default 24, `0` = off). |
-| `defaults.retry_diff_kb` | Show the next attempt the rejected attempt's diff up to this size (default 40, `0` = off). |
-| `defaults.review_inline_diff_kb` | Truncate the diff pasted to the reviewer at this size (default 120); the reviewer uses `git diff` for the rest. |
-| `defaults.stream_tools` | Default `false`. Set `true` to also print every tool call (🔧 Bash commands, file paths) in the live view. |
-| `defaults.stream` | Default `true`: use `stream-json` for the live view. Set `false` to fall back to `--output-format json` if your Claude Code version has stream issues. |
-| `task.depends_on` | Task ids this task depends on. If a dependency fails or is blocked, this task is skipped; other branches continue. |
-| `task.verify` | Task-specific checks, run in addition to `defaults.verify`. |
-| `task.skip_default_verify` | `true`: run only `task.verify`, not `defaults.verify` (docs and read-only tasks). |
-| `task.full_verify` | `true` forces the full tier for this task; `false` keeps it out of the `full_verify_every` checkpoints. |
-| `task.review` | If `true`, a read-only reviewer session (default Opus/high) must approve the diff. |
-| `task.escalate_to` | `{ "model": ..., "effort": ... }` used from the second attempt on. |
-| `task.context_files` | Files the worker should look at first, saving exploration context. |
-
-A complete example is in [`examples/tasks.example.json`](examples/tasks.example.json).
+| [docs/configuration.md](docs/configuration.md) | Full `tasks.json` reference, verification tiers, cost and time savers |
+| [docs/herdr.md](docs/herdr.md) | Detached runs, sidebar status, notifications, auto-resume |
+| [examples/](examples/) | A complete sample plan and spec |
+| [CHANGELOG.md](CHANGELOG.md) | Release notes |
 
 ## Safety
 
 - Workers are forbidden from `git push`, `commit`, `reset`, `rebase`, `merge`, and switching branches. Only the script commits, and only inside its own worktree.
-- The default `auto` permission mode has a classifier vet each command on your behalf and block risky ones. If you'd rather use `bypassPermissions` so nothing is ever refused, do so **only** in a devcontainer, Docker, or VM with no production credentials — never on your main machine.
+- The default `auto` permission mode has a classifier vet each command and block risky ones. Use `bypassPermissions` **only** in a devcontainer, Docker, or VM with no production credentials, never on your main machine.
 - Add deny rules in `~/.claude/settings.json` for anything you never want run unattended (deploys, production database commands, etc.).
 - `--max-total-usd` stops the run when estimated total cost passes the threshold. The figure is a client-side estimate and may differ from your actual bill.
 - On a subscription plan, an overnight run consumes your session and weekly limits. The script sleeps until the limit resets and continues, but a weekly limit may not reset overnight.
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Limitations and alternatives
 
 Tasks run **sequentially**, by design: each task builds on the previous verified commit, there are no merge conflicts, and for an overnight run sequential throughput is usually enough. Inside a task, the worker still uses subagents to parallelize searching.
 
-Claude Code has other multi-agent options that fit different situations:
+Claude Code has other multi-agent options for different situations:
 
-- **Dynamic workflows** (`/workflows`, the `ultracode` keyword) — fan-out of many identical agents, such as auditing hundreds of files or migrating independent files, within an interactive session.
-- **Projects** on claude.ai/code — when you want the work to run in the cloud even with your machine off.
-- **Agent teams** (experimental, off by default) — when you want a lead coordinating sessions that talk to each other.
+- **Dynamic workflows** (`/workflows`, the `ultracode` keyword): fan-out of many identical agents, such as auditing hundreds of files, within an interactive session.
+- **Projects** on claude.ai/code: run in the cloud with your machine off.
+- **Agent teams** (experimental, off by default): a lead coordinating sessions that talk to each other.
 
 autopilot fits best for an ordered chain of tasks on your own machine or server, with verification gates between steps.
 
@@ -256,11 +189,18 @@ autopilot.py                 # the orchestrator (standard library only)
 prompts/worker.md            # rules for workers, loaded via --append-system-prompt-file
 prompts/reviewer.md          # rules for the reviewer
 skills/autopilot-plan/       # the /autopilot-plan skill used in the planning session
-examples/tasks.example.json  # sample plan file
+examples/                    # sample plan (tasks.example.json) and spec
+docs/                        # configuration and herdr guides
+assets/                      # logo and illustrations
+tests/                       # smoke tests (python -m unittest)
 install.sh                   # installs the command and the skill
 ```
 
 In the repo you're working on, each plan lives in `.autopilot/<plan-id>/`. The `run/` directory (state, per-session JSONL logs, `live.log`, `REPORT.md`) is added to `.git/info/exclude` automatically. `PROGRESS.md` and `DECISIONS.md` live in the worktree and travel with each commit so later workers know what earlier ones did.
+
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests and conventions, and the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Versioning
 
